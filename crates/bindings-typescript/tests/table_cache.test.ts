@@ -834,6 +834,54 @@ describe('TableCache', () => {
       expect(iter).not.toHaveBeenCalled();
     });
 
+    test('a key wrapped as a one-element tuple answers as before', () => {
+      const cache = cacheOf([mk(1, 7), mk(2, 8)]);
+      expect(cache.id.find([2])).toEqual(mk(2, 8));
+      expect(cache.name.find(['score 1'])).toEqual(mk(1, 7));
+      expect(cache.id.find([1, 2])).toBeNull();
+      expect(ids(cache.player.filter([7]))).toEqual([1]);
+    });
+
+    test('an index on a table without a primary key', () => {
+      const { tally } = schema({
+        tally: table(
+          {
+            name: 'tally',
+            indexes: [
+              {
+                accessor: 'player',
+                name: 'tally_player_idx_btree',
+                algorithm: 'btree',
+                columns: ['player'],
+              },
+            ],
+          },
+          t.row({ player: t.u32(), points: t.u32() })
+        ),
+      }).schemaType.tables;
+      const cache: any = new TableCacheImpl(tally as any);
+      // without a primary key a row's id is the row itself
+      const tallyOp = (type: 'insert' | 'delete', row: object) => ({
+        type,
+        rowId: JSON.stringify(row),
+        row,
+      });
+      cache.applyOperations(
+        [
+          tallyOp('insert', { player: 7, points: 1 }),
+          tallyOp('insert', { player: 7, points: 2 }),
+          tallyOp('insert', { player: 8, points: 3 }),
+        ],
+        {} as any
+      );
+      cache.applyOperations(
+        [tallyOp('delete', { player: 7, points: 1 })],
+        {} as any
+      );
+      expect([...cache.player.filter(7)]).toEqual([{ player: 7, points: 2 }]);
+      expect([...cache.player.filter(8)]).toEqual([{ player: 8, points: 3 }]);
+    });
+
     test('a range still answers, by scanning', () => {
       const cache = cacheOf([mk(1, 7), mk(2, 8), mk(3, 9)]);
       const range = {

@@ -79,8 +79,7 @@ export class TableCacheImpl<
    * scanning the table. Kept in step with `rows` by `#reindex`.
    */
   #buckets: {
-    column: string;
-    keyType: AlgebraicType;
+    keyOf: (row: object) => ComparablePrimitive;
     rows: Map<
       ComparablePrimitive,
       Map<
@@ -226,7 +225,14 @@ export class TableCacheImpl<
           return entry && [entry[0] as Row];
         };
       } else {
-        const bucket = { column, keyType, rows: new Map() };
+        const bucket = {
+          keyOf: (row: object) =>
+            AlgebraicType.intoMapKey(
+              keyType,
+              (row as Record<string, unknown>)[column]
+            ),
+          rows: new Map(),
+        };
         self.#buckets.push(bucket);
         lookup = value =>
           bucket.rows.get(AlgebraicType.intoMapKey(keyType, value))?.values();
@@ -239,6 +245,11 @@ export class TableCacheImpl<
       const impl: ReadonlyUniqueIndex<TableDef, I> = {
         find: (colVal: any): Row | null => {
           if (lookup) {
+            // A one-column key may come wrapped as a tuple, as the scan took it.
+            if (Array.isArray(colVal)) {
+              if (colVal.length !== 1) return null;
+              colVal = colVal[0];
+            }
             for (const row of lookup(colVal) ?? []) return row;
             return null;
           }
@@ -267,18 +278,16 @@ export class TableCacheImpl<
     }
   }
 
-  /** Moves row `rowId` in every bucket from `oldRow`'s key to `newRow`'s (either absent: added or removed). */
+  /**
+   * Moves row `rowId` in every bucket from `oldRow`'s key to `newRow`'s
+   * (either absent: the row is added or removed).
+   */
   #reindex(
     rowId: ComparablePrimitive,
     oldRow: RowType<TableDefForTableName<RemoteModule, TableName>> | undefined,
     newRow: RowType<TableDefForTableName<RemoteModule, TableName>> | undefined
   ): void {
-    for (const { column, keyType, rows } of this.#buckets) {
-      const keyOf = (row: object) =>
-        AlgebraicType.intoMapKey(
-          keyType,
-          (row as Record<string, unknown>)[column]
-        );
+    for (const { keyOf, rows } of this.#buckets) {
       const newKey = newRow && keyOf(newRow);
       if (oldRow) {
         const oldKey = keyOf(oldRow);
