@@ -1,7 +1,7 @@
 import { EventEmitter } from './event_emitter.ts';
 
 import { stdbLogger } from './logger.ts';
-import { deepEqual, type ComparablePrimitive } from '../';
+import { AlgebraicType, deepEqual, type ComparablePrimitive } from '../';
 import type { EventContextInterface, TableDefForTableName } from './index.ts';
 import type { RowType, TableIndexes, UntypedTableDef } from '../lib/table.ts';
 import type { ClientTableCoreImplementable } from './client_table.ts';
@@ -73,6 +73,22 @@ export class TableCacheImpl<
   >;
   private tableDef: TableDefForTableName<RemoteModule, TableName>;
   private emitter: EventEmitter<'insert' | 'delete' | 'update'>;
+  /**
+   * The rows of each single-column index that is not the primary key, by
+   * key, then by row id: an equality lookup reads its bucket instead of
+   * scanning the table. Kept in step with `rows` by `#reindex`.
+   */
+  #buckets: {
+    column: string;
+    keyType: AlgebraicType;
+    rows: Map<
+      ComparablePrimitive,
+      Map<
+        ComparablePrimitive,
+        RowType<TableDefForTableName<RemoteModule, TableName>>
+      >
+    >;
+  }[] = [];
 
   /**
    * @param name the table name
@@ -102,7 +118,6 @@ export class TableCacheImpl<
     }
   }
 
-  // TODO: this just scans the whole table; we should build proper index structures
   #makeReadonlyIndex<
     I extends TableDefForTableName<
       RemoteModule,
@@ -195,9 +210,38 @@ export class TableCacheImpl<
 
     // eslint-disable-next-line @typescript-eslint/no-this-alias
     const self = this;
+
+    // A single-column index answers a lookup of one value from a map: the
+    // primary key's from `rows`, which is keyed by it (see `Operation.rowId`),
+    // any other from its own buckets. Ranges and multi-column keys still scan.
+    const column = columns.length === 1 ? columns[0] : undefined;
+    const columnDef =
+      column === undefined ? undefined : tableDef.columns[column];
+    let lookup: ((value: unknown) => Iterable<Row> | undefined) | undefined;
+    if (column !== undefined && columnDef) {
+      const keyType = columnDef.typeBuilder.algebraicType;
+      if (columnDef.columnMetadata.isPrimaryKey) {
+        lookup = value => {
+          const entry = self.rows.get(AlgebraicType.intoMapKey(keyType, value));
+          return entry && [entry[0] as Row];
+        };
+      } else {
+        const bucket = { column, keyType, rows: new Map() };
+        self.#buckets.push(bucket);
+        lookup = value =>
+          bucket.rows.get(AlgebraicType.intoMapKey(keyType, value))?.values();
+      }
+    }
+    const isRange = (arg: any): boolean =>
+      !!arg && typeof arg === 'object' && 'from' in arg && 'to' in arg;
+
     if (isUnique) {
       const impl: ReadonlyUniqueIndex<TableDef, I> = {
         find: (colVal: any): Row | null => {
+          if (lookup) {
+            for (const row of lookup(colVal) ?? []) return row;
+            return null;
+          }
           // For unique btree, caller supplies the *full* key (tuple if multi-col).
           const expected = Array.isArray(colVal) ? colVal : [colVal];
           for (const row of self.iter()) {
@@ -210,12 +254,45 @@ export class TableCacheImpl<
     } else {
       const impl: ReadonlyRangedIndex<TableDef, I> = {
         *filter(range: any): IteratorObject<Row, undefined> {
+          if (lookup && !isRange(range) && !Array.isArray(range)) {
+            yield* lookup(range) ?? [];
+            return;
+          }
           for (const row of self.iter()) {
             if (matchRange(row, range)) yield row;
           }
         },
       };
       return impl as ReadonlyIndex<TableDef, I>;
+    }
+  }
+
+  /** Moves row `rowId` in every bucket from `oldRow`'s key to `newRow`'s (either absent: added or removed). */
+  #reindex(
+    rowId: ComparablePrimitive,
+    oldRow: RowType<TableDefForTableName<RemoteModule, TableName>> | undefined,
+    newRow: RowType<TableDefForTableName<RemoteModule, TableName>> | undefined
+  ): void {
+    for (const { column, keyType, rows } of this.#buckets) {
+      const keyOf = (row: object) =>
+        AlgebraicType.intoMapKey(
+          keyType,
+          (row as Record<string, unknown>)[column]
+        );
+      const newKey = newRow && keyOf(newRow);
+      if (oldRow) {
+        const oldKey = keyOf(oldRow);
+        const bucket = rows.get(oldKey);
+        if (bucket && oldKey !== newKey) {
+          bucket.delete(rowId);
+          if (bucket.size === 0) rows.delete(oldKey);
+        }
+      }
+      if (newRow && newKey !== undefined) {
+        let bucket = rows.get(newKey);
+        if (!bucket) rows.set(newKey, (bucket = new Map()));
+        bucket.set(rowId, newRow);
+      }
     }
   }
 
@@ -405,6 +482,7 @@ export class TableCacheImpl<
       return undefined;
     }
     this.rows.set(rowId, [newRow, refCount]);
+    this.#reindex(rowId, oldRow, newRow);
     if (skipIfIdentical && deepEqual(oldRow, newRow)) {
       // The row is unchanged; the reference count was adjusted above but no
       // callback fires.
@@ -440,11 +518,16 @@ export class TableCacheImpl<
     >,
     count: number = 1
   ): PendingCallback | undefined => {
-    const [_, previousCount] = this.rows.get(operation.rowId) || [
+    const [cachedRow, previousCount] = this.rows.get(operation.rowId) || [
       operation.row,
       0,
     ];
     this.rows.set(operation.rowId, [operation.row, previousCount + count]);
+    this.#reindex(
+      operation.rowId,
+      previousCount > 0 ? cachedRow : undefined,
+      operation.row
+    );
     if (previousCount === 0) {
       return {
         type: 'insert',
@@ -465,7 +548,7 @@ export class TableCacheImpl<
     >,
     count: number = 1
   ): PendingCallback | undefined => {
-    const [_, previousCount] = this.rows.get(operation.rowId) || [
+    const [cachedRow, previousCount] = this.rows.get(operation.rowId) || [
       operation.row,
       0,
     ];
@@ -478,6 +561,7 @@ export class TableCacheImpl<
     if (previousCount <= count) {
       // TODO: Log a warning/error if previousCount is less than count.
       this.rows.delete(operation.rowId);
+      this.#reindex(operation.rowId, cachedRow, undefined);
       return {
         type: 'delete',
         table: this.tableDef.sourceName,
@@ -487,6 +571,7 @@ export class TableCacheImpl<
       };
     }
     this.rows.set(operation.rowId, [operation.row, previousCount - count]);
+    this.#reindex(operation.rowId, cachedRow, operation.row);
     return undefined;
   };
 
