@@ -75,3 +75,15 @@ describe('BTreeIndex', () => {
     expect([...index.filter(sameOwner)].map(row => row.id)).toEqual([1]);
   });
 });
+
+describe('a value the column cannot hold', () => {
+  test('matches nothing instead of throwing', () => {
+    const table = fakeTable<{ id: number; owner: Identity }>();
+    const unique = new UniqueIndex(table, 'owner', Identity.getAlgebraicType());
+    const many = new BTreeIndex(table, 'owner', Identity.getAlgebraicType());
+    table.insert({ id: 1, owner: Identity.fromString('ab'.repeat(32)) });
+    expect(unique.find(undefined)).toBeNull();
+    expect(unique.find(null)).toBeNull();
+    expect([...many.filter(undefined)]).toEqual([]);
+  });
+});

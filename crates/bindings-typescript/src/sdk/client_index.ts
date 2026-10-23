@@ -33,6 +33,21 @@ abstract class IndexBase<Row extends object> {
   protected keyOf(value: unknown): ComparablePrimitive {
     return AlgebraicType.intoMapKey(this.#keyType, value);
   }
+
+  /**
+   * The key to look `value` up by, or `undefined` for a value the column
+   * can't hold. C#'s typed `Find(Column value)` can't be given one, but here
+   * `identity.find(conn.identity)` before the connection has its identity
+   * passes `undefined`: that matches nothing, as the scan's `deepEqual` did,
+   * instead of throwing from the serializer.
+   */
+  protected lookupKey(value: unknown): ComparablePrimitive | undefined {
+    try {
+      return this.keyOf(value);
+    } catch {
+      return undefined;
+    }
+  }
 }
 
 /** A unique index: each value has at most one row. C#'s `UniqueIndexBase`. */
@@ -56,7 +71,8 @@ export class UniqueIndex<Row extends object> extends IndexBase<Row> {
   }
 
   find(value: unknown): Row | null {
-    return this.#cache.get(this.keyOf(value)) ?? null;
+    const key = this.lookupKey(value);
+    return key === undefined ? null : (this.#cache.get(key) ?? null);
   }
 }
 
@@ -93,6 +109,7 @@ export class BTreeIndex<Row extends object> extends IndexBase<Row> {
   }
 
   filter(value: unknown): Iterable<Row> {
-    return this.#cache.get(this.keyOf(value)) ?? [];
+    const key = this.lookupKey(value);
+    return key === undefined ? [] : (this.#cache.get(key) ?? []);
   }
 }
