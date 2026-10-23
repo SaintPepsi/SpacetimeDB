@@ -1,5 +1,5 @@
-import { describe, expect, test } from 'vitest';
-import { AlgebraicType, Identity, type Infer } from '../src';
+import { describe, expect, test, vi } from 'vitest';
+import { AlgebraicType, Identity, schema, t, table, type Infer } from '../src';
 import { type Operation, TableCacheImpl } from '../src/sdk/table_cache';
 import { tables } from '../test-app/src/module_bindings/index.ts';
 import { Player } from '../test-app/src/module_bindings/types';
@@ -752,6 +752,270 @@ describe('TableCache', () => {
         cb.cb();
       });
       expect(rowsInserted).toEqual(1);
+    });
+  });
+
+  describe('index lookups', () => {
+    // A score per row: `id` the primary key, `player` an index (not unique),
+    // `name` a unique column that is not the primary key.
+    const { score } = schema({
+      score: table(
+        {
+          name: 'score',
+          indexes: [
+            {
+              accessor: 'player',
+              name: 'score_player_idx_btree',
+              algorithm: 'btree',
+              columns: ['player'],
+            },
+            {
+              accessor: 'name',
+              name: 'score_name_idx_btree',
+              algorithm: 'btree',
+              columns: ['name'],
+            },
+          ],
+          constraints: [
+            { name: 'score_name_key', constraint: 'unique', columns: ['name'] },
+          ],
+        },
+        t.row({
+          id: t.u32().primaryKey(),
+          player: t.u32(),
+          name: t.string(),
+          points: t.u32(),
+        })
+      ),
+    }).schemaType.tables;
+    type Score = { id: number; player: number; name: string; points: number };
+    const mk = (id: number, player: number, points = 0): Score => ({
+      id,
+      player,
+      name: `score ${id}`,
+      points,
+    });
+    const op = (type: 'insert' | 'delete', row: Score) => ({
+      type,
+      rowId: row.id,
+      row,
+    });
+    const cacheOf = (rows: Score[]) => {
+      const cache: any = new TableCacheImpl(score as any);
+      cache.applyOperations(
+        rows.map(r => op('insert', r)),
+        {} as any
+      );
+      return cache;
+    };
+    const ids = (rows: Iterable<Score>) => [...rows].map(r => r.id).sort();
+
+    test('find on the primary key does not scan the table', () => {
+      const cache = cacheOf([mk(1, 7), mk(2, 7), mk(3, 8)]);
+      const iter = vi.spyOn(cache, 'iter');
+      expect(cache.id.find(2)).toEqual(mk(2, 7));
+      expect(cache.id.find(4)).toBeNull();
+      expect(iter).not.toHaveBeenCalled();
+    });
+
+    test('find on a unique column that is not the primary key does not scan', () => {
+      const cache = cacheOf([mk(1, 7), mk(2, 7)]);
+      const iter = vi.spyOn(cache, 'iter');
+      expect(cache.name.find('score 2')).toEqual(mk(2, 7));
+      expect(cache.name.find('score 3')).toBeNull();
+      expect(iter).not.toHaveBeenCalled();
+    });
+
+    test('filter on one value does not scan the table', () => {
+      const cache = cacheOf([mk(1, 7), mk(2, 7), mk(3, 8)]);
+      const iter = vi.spyOn(cache, 'iter');
+      expect(ids(cache.player.filter(7))).toEqual([1, 2]);
+      expect(ids(cache.player.filter(9))).toEqual([]);
+      expect(iter).not.toHaveBeenCalled();
+    });
+
+    test('a row a second subscription also holds stays as it was, in the cache and its index', () => {
+      const cache = cacheOf([mk(1, 7), mk(2, 7)]);
+      const held = cache.id.find(1);
+      cache.applyOperations([op('insert', mk(1, 7))], {} as any); // a second subscription
+      cache.applyOperations([op('delete', mk(1, 7))], {} as any); // one lets go
+      expect(cache.id.find(1)).toBe(held);
+      expect([...cache.player.filter(7)].map((r: Score) => r.id)).toEqual([
+        1, 2,
+      ]);
+      cache.applyOperations([op('delete', mk(1, 7))], {} as any); // the other lets go
+      expect(ids(cache.player.filter(7))).toEqual([2]);
+      expect(cache.id.find(1)).toBeNull();
+    });
+
+    test('a unique value moving to another row in one transaction is found on the new row', () => {
+      const cache = cacheOf([mk(1, 7)]);
+      const renamed = { ...mk(2, 7), name: 'score 1' };
+      // inserts are applied before deletes
+      cache.applyOperations(
+        [op('delete', mk(1, 7)), op('insert', renamed)],
+        {} as any
+      );
+      expect(cache.name.find('score 1')).toEqual(renamed);
+    });
+
+    test('find on a unique array column takes the array as the value', () => {
+      const { tagged } = schema({
+        tagged: table(
+          {
+            name: 'tagged',
+            indexes: [
+              {
+                accessor: 'tags',
+                name: 'tagged_tags_idx_btree',
+                algorithm: 'btree',
+                columns: ['tags'],
+              },
+            ],
+            constraints: [
+              {
+                name: 'tagged_tags_key',
+                constraint: 'unique',
+                columns: ['tags'],
+              },
+            ],
+          },
+          t.row({ id: t.u32().primaryKey(), tags: t.array(t.string()) })
+        ),
+      }).schemaType.tables;
+      const cache: any = new TableCacheImpl(tagged as any);
+      const one = { id: 1, tags: ['a', 'b'] };
+      const two = { id: 2, tags: ['ab'] };
+      cache.applyOperations(
+        [one, two].map(row => ({ type: 'insert', rowId: row.id, row })),
+        {} as any
+      );
+      expect(cache.tags.find(['a', 'b'])).toEqual(one);
+      expect(cache.tags.find(['ab'])).toEqual(two);
+      expect(cache.tags.find(['b'])).toBeNull();
+    });
+
+    test('a key wrapped as a one-element tuple answers as before', () => {
+      const cache = cacheOf([mk(1, 7), mk(2, 8)]);
+      expect(cache.id.find([2])).toEqual(mk(2, 8));
+      expect(cache.name.find(['score 1'])).toEqual(mk(1, 7));
+      expect(cache.id.find([1, 2])).toBeNull();
+      expect(ids(cache.player.filter([7]))).toEqual([1]);
+    });
+
+    test('an index on a table without a primary key', () => {
+      const { tally } = schema({
+        tally: table(
+          {
+            name: 'tally',
+            indexes: [
+              {
+                accessor: 'player',
+                name: 'tally_player_idx_btree',
+                algorithm: 'btree',
+                columns: ['player'],
+              },
+            ],
+          },
+          t.row({ player: t.u32(), points: t.u32() })
+        ),
+      }).schemaType.tables;
+      const cache: any = new TableCacheImpl(tally as any);
+      // without a primary key a row's id is the row itself
+      const tallyOp = (type: 'insert' | 'delete', row: object) => ({
+        type,
+        rowId: JSON.stringify(row),
+        row,
+      });
+      cache.applyOperations(
+        [
+          tallyOp('insert', { player: 7, points: 1 }),
+          tallyOp('insert', { player: 7, points: 2 }),
+          tallyOp('insert', { player: 8, points: 3 }),
+        ],
+        {} as any
+      );
+      cache.applyOperations(
+        [tallyOp('delete', { player: 7, points: 1 })],
+        {} as any
+      );
+      expect([...cache.player.filter(7)]).toEqual([{ player: 7, points: 2 }]);
+      expect([...cache.player.filter(8)]).toEqual([{ player: 8, points: 3 }]);
+    });
+
+    test('a range still answers, by scanning', () => {
+      const cache = cacheOf([mk(1, 7), mk(2, 8), mk(3, 9)]);
+      const range = {
+        from: { tag: 'included', value: 8 },
+        to: { tag: 'unbounded' },
+      };
+      expect(ids(cache.player.filter(range))).toEqual([2, 3]);
+    });
+
+    test('lookups follow inserts, updates that change the key, and deletes', () => {
+      const cache = cacheOf([mk(1, 7), mk(2, 7)]);
+      // an update arrives as a delete and an insert of the same primary key
+      cache.applyOperations(
+        [op('delete', mk(1, 7)), op('insert', mk(1, 8, 5))],
+        {} as any
+      );
+      expect(ids(cache.player.filter(7))).toEqual([2]);
+      expect(cache.player.filter(8).next().value).toEqual(mk(1, 8, 5));
+      expect(cache.id.find(1)).toEqual(mk(1, 8, 5));
+      cache.applyOperations([op('delete', mk(2, 7))], {} as any);
+      expect(ids(cache.player.filter(7))).toEqual([]);
+      expect(cache.name.find('score 2')).toBeNull();
+    });
+
+    test('a row held by two subscriptions stays until both let it go', () => {
+      const cache = cacheOf([mk(1, 7)]);
+      cache.applyOperations([op('insert', mk(1, 7))], {} as any);
+      cache.applyOperations([op('delete', mk(1, 7))], {} as any);
+      expect(ids(cache.player.filter(7))).toEqual([1]);
+      cache.applyOperations([op('delete', mk(1, 7))], {} as any);
+      expect(ids(cache.player.filter(7))).toEqual([]);
+    });
+
+    test('every lookup agrees with a scan through random changes', () => {
+      const cache = cacheOf([]);
+      const live = new Map<number, Score>();
+      let seed = 1;
+      const next = (n: number) => {
+        seed = (seed * 1103515245 + 12345) % 2 ** 31;
+        return seed % n;
+      };
+      for (let round = 0; round < 200; round++) {
+        const ops = [];
+        const touched = new Set<number>();
+        for (let k = 0; k < 5; k++) {
+          const id = next(40);
+          if (touched.has(id)) continue;
+          touched.add(id);
+          const had = live.get(id);
+          const roll = next(3);
+          if (!had) {
+            const row = mk(id, next(6), round);
+            ops.push(op('insert', row));
+            live.set(id, row);
+          } else if (roll === 0) {
+            ops.push(op('delete', had));
+            live.delete(id);
+          } else {
+            const row = mk(id, next(6), round);
+            ops.push(op('delete', had), op('insert', row));
+            live.set(id, row);
+          }
+        }
+        cache.applyOperations(ops, {} as any);
+        for (let player = 0; player < 6; player++) {
+          const scanned = [...live.values()].filter(r => r.player === player);
+          expect(ids(cache.player.filter(player))).toEqual(ids(scanned));
+        }
+        for (let id = 0; id < 40; id++) {
+          expect(cache.id.find(id)).toEqual(live.get(id) ?? null);
+          expect(cache.name.find(`score ${id}`)).toEqual(live.get(id) ?? null);
+        }
+      }
     });
   });
 

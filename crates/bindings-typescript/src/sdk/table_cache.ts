@@ -2,6 +2,11 @@ import { EventEmitter } from './event_emitter.ts';
 
 import { stdbLogger } from './logger.ts';
 import { deepEqual, type ComparablePrimitive } from '../';
+import {
+  BTreeIndex,
+  UniqueIndex,
+  type InternalTableEvents,
+} from './client_index.ts';
 import type { EventContextInterface, TableDefForTableName } from './index.ts';
 import type { RowType, TableIndexes, UntypedTableDef } from '../lib/table.ts';
 import type { ClientTableCoreImplementable } from './client_table.ts';
@@ -37,12 +42,18 @@ export type PendingCallback = {
   cb: () => void;
 };
 
+// A `Range<T>` argument to an index lookup, as opposed to one value.
+const isRange = (arg: any): boolean =>
+  !!arg && typeof arg === 'object' && 'from' in arg && 'to' in arg;
+
 // Strict scalar compare for index term values.
 const scalarCompare = (x: any, y: any): number => {
   if (x === y) return 0;
   // Compare booleans/numbers/bigints/strings with JS ordering.
   return x < y ? -1 : 1;
 };
+
+type CachedRow = Record<string, any>;
 
 export type TableIndexView<
   RemoteModule extends UntypedRemoteModule,
@@ -74,6 +85,16 @@ export class TableCacheImpl<
   private tableDef: TableDefForTableName<RemoteModule, TableName>;
   private emitter: EventEmitter<'insert' | 'delete' | 'update'>;
 
+  // These are used by indexes to add and remove rows (C#'s
+  // `OnInternalInsert` / `OnInternalDelete`). They run as the cache changes,
+  // before any user callback.
+  #internalInsertListeners: ((row: CachedRow) => void)[] = [];
+  #internalDeleteListeners: ((row: CachedRow) => void)[] = [];
+  #internalEvents: InternalTableEvents<CachedRow> = {
+    onInternalInsert: listener => this.#internalInsertListeners.push(listener),
+    onInternalDelete: listener => this.#internalDeleteListeners.push(listener),
+  };
+
   /**
    * @param name the table name
    * @param primaryKeyCol column index designated as `#[primarykey]`
@@ -93,16 +114,20 @@ export class TableCacheImpl<
     // - `indexes` is declarative table-level config (`IndexOpts`) used mainly for typing.
     // - `resolvedIndexes` is the runtime shape (`UntypedIndex`) that includes both
     //   field-level and explicit table-level indexes.
-    for (const idxDef of this.tableDef.resolvedIndexes) {
+    //
+    // IMPORTANT: for duplicate accessor names, client cache uses assignment
+    // semantics and later entries overwrite earlier ones. This matches prior
+    // behavior and is intentionally different from server runtime merge logic.
+    // Only the last entry per name is built, since an index keeps rows.
+    const lastByName = new Map(
+      this.tableDef.resolvedIndexes.map(idxDef => [idxDef.name, idxDef])
+    );
+    for (const idxDef of lastByName.values()) {
       const index = this.#makeReadonlyIndex(this.tableDef, idxDef);
-      // IMPORTANT: for duplicate accessor names, client cache uses assignment
-      // semantics and later entries overwrite earlier ones. This matches prior
-      // behavior and is intentionally different from server runtime merge logic.
       (this as any)[idxDef.name] = index;
     }
   }
 
-  // TODO: this just scans the whole table; we should build proper index structures
   #makeReadonlyIndex<
     I extends TableDefForTableName<
       RemoteModule,
@@ -150,12 +175,7 @@ export class TableCacheImpl<
       const kLast = key[prefixLen];
 
       // If the last provided is a Range<T>, apply bounds; otherwise equality.
-      if (
-        lastProvided &&
-        typeof lastProvided === 'object' &&
-        'from' in lastProvided &&
-        'to' in lastProvided
-      ) {
+      if (isRange(lastProvided)) {
         // Range<T>
         const from = lastProvided.from as Bound<any>;
         const to = lastProvided.to as Bound<any>;
@@ -195,9 +215,31 @@ export class TableCacheImpl<
 
     // eslint-disable-next-line @typescript-eslint/no-this-alias
     const self = this;
+    // A one-column index keeps its rows by value, as the C# SDK's do.
+    // Multi-column indexes still scan.
+    const column = columns.length === 1 ? columns[0] : undefined;
+    const keyType =
+      column === undefined
+        ? undefined
+        : tableDef.columns[column]?.typeBuilder.algebraicType;
     if (isUnique) {
+      const index =
+        column === undefined || keyType === undefined
+          ? undefined
+          : new UniqueIndex(this.#internalEvents, column, keyType);
       const impl: ReadonlyUniqueIndex<TableDef, I> = {
         find: (colVal: any): Row | null => {
+          if (index) {
+            // An array column's value is itself an array. Any other column's
+            // value may also come wrapped as a one-element tuple, which the
+            // scan below accepts.
+            if (keyType?.tag === 'Array' || !Array.isArray(colVal)) {
+              return index.find(colVal) as Row | null;
+            }
+            return colVal.length === 1
+              ? (index.find(colVal[0]) as Row | null)
+              : null;
+          }
           // For unique btree, caller supplies the *full* key (tuple if multi-col).
           const expected = Array.isArray(colVal) ? colVal : [colVal];
           for (const row of self.iter()) {
@@ -208,8 +250,16 @@ export class TableCacheImpl<
       };
       return impl as ReadonlyIndex<TableDef, I>;
     } else {
+      const index =
+        column === undefined || keyType === undefined
+          ? undefined
+          : new BTreeIndex(this.#internalEvents, column, keyType);
       const impl: ReadonlyRangedIndex<TableDef, I> = {
         *filter(range: any): IteratorObject<Row, undefined> {
+          if (index && !Array.isArray(range) && !isRange(range)) {
+            yield* index.filter(range) as Iterable<Row>;
+            return;
+          }
           for (const row of self.iter()) {
             if (matchRange(row, range)) yield row;
           }
@@ -217,6 +267,14 @@ export class TableCacheImpl<
       };
       return impl as ReadonlyIndex<TableDef, I>;
     }
+  }
+
+  #internalInsert(row: CachedRow): void {
+    for (const listener of this.#internalInsertListeners) listener(row);
+  }
+
+  #internalDelete(row: CachedRow): void {
+    for (const listener of this.#internalDeleteListeners) listener(row);
   }
 
   /**
@@ -405,6 +463,8 @@ export class TableCacheImpl<
       return undefined;
     }
     this.rows.set(rowId, [newRow, refCount]);
+    this.#internalDelete(oldRow);
+    this.#internalInsert(newRow);
     if (skipIfIdentical && deepEqual(oldRow, newRow)) {
       // The row is unchanged; the reference count was adjusted above but no
       // callback fires.
@@ -440,12 +500,15 @@ export class TableCacheImpl<
     >,
     count: number = 1
   ): PendingCallback | undefined => {
-    const [_, previousCount] = this.rows.get(operation.rowId) || [
+    const [cachedRow, previousCount] = this.rows.get(operation.rowId) || [
       operation.row,
       0,
     ];
-    this.rows.set(operation.rowId, [operation.row, previousCount + count]);
+    // A row another subscription already holds keeps its cached object, the
+    // one the indexes hold.
+    this.rows.set(operation.rowId, [cachedRow, previousCount + count]);
     if (previousCount === 0) {
+      this.#internalInsert(operation.row);
       return {
         type: 'insert',
         table: this.tableDef.sourceName,
@@ -465,7 +528,7 @@ export class TableCacheImpl<
     >,
     count: number = 1
   ): PendingCallback | undefined => {
-    const [_, previousCount] = this.rows.get(operation.rowId) || [
+    const [cachedRow, previousCount] = this.rows.get(operation.rowId) || [
       operation.row,
       0,
     ];
@@ -478,6 +541,7 @@ export class TableCacheImpl<
     if (previousCount <= count) {
       // TODO: Log a warning/error if previousCount is less than count.
       this.rows.delete(operation.rowId);
+      this.#internalDelete(cachedRow);
       return {
         type: 'delete',
         table: this.tableDef.sourceName,
@@ -486,7 +550,7 @@ export class TableCacheImpl<
         },
       };
     }
-    this.rows.set(operation.rowId, [operation.row, previousCount - count]);
+    this.rows.set(operation.rowId, [cachedRow, previousCount - count]);
     return undefined;
   };
 
