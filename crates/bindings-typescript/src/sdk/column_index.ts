@@ -5,8 +5,9 @@ import { AlgebraicType, type ComparablePrimitive } from '../';
  * column's value, so looking up one value reads its group instead of
  * scanning the whole table.
  *
- * The table cache calls `add` when a row enters the cache and `remove` when
- * it leaves; an update is a `remove` of the old row and an `add` of the new.
+ * The table cache calls `add` when a row enters the cache, `update` when it
+ * changes, and `remove` when it leaves. Rows in a group keep the order they
+ * entered in, as the cache's own rows do.
  */
 export class ColumnIndex<Row extends object> {
   readonly #column: string;
@@ -35,6 +36,18 @@ export class ColumnIndex<Row extends object> {
       this.#groups.set(key, group);
     }
     group.set(rowId, row);
+  }
+
+  update(rowId: ComparablePrimitive, oldRow: Row, newRow: Row): void {
+    const oldKey = this.#keyOfRow(oldRow);
+    const newKey = this.#keyOfRow(newRow);
+    if (oldKey === newKey) {
+      // Same value: replace it in place, keeping its position in the group.
+      this.#groups.get(newKey)?.set(rowId, newRow);
+      return;
+    }
+    this.remove(rowId, oldRow);
+    this.add(rowId, newRow);
   }
 
   remove(rowId: ComparablePrimitive, row: Row): void {

@@ -27,13 +27,15 @@ describe('ColumnIndex', () => {
     expect([...index.rowsWith(7)]).toEqual([]);
   });
 
-  test('an update is a remove of the old row and an add of the new', () => {
+  test('an update that keeps its value keeps its place; one that changes it moves', () => {
     const index = scores();
     index.add(1, { id: 1, player: 7 });
-    index.remove(1, { id: 1, player: 7 });
-    index.add(1, { id: 1, player: 8 });
-    expect([...index.rowsWith(7)]).toEqual([]);
-    expect([...index.rowsWith(8)]).toEqual([{ id: 1, player: 8 }]);
+    index.add(2, { id: 2, player: 7 });
+    index.update(1, { id: 1, player: 7 }, { id: 1, player: 7 });
+    expect([...index.rowsWith(7)].map(row => row.id)).toEqual([1, 2]);
+    index.update(1, { id: 1, player: 7 }, { id: 1, player: 8 });
+    expect([...index.rowsWith(7)].map(row => row.id)).toEqual([2]);
+    expect([...index.rowsWith(8)].map(row => row.id)).toEqual([1]);
   });
 
   test('values that are objects match by content, not by reference', () => {

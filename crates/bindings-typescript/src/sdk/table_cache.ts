@@ -38,6 +38,10 @@ export type PendingCallback = {
   cb: () => void;
 };
 
+// A `Range<T>` argument to an index lookup, as opposed to one value.
+const isRange = (arg: any): boolean =>
+  !!arg && typeof arg === 'object' && 'from' in arg && 'to' in arg;
+
 // Strict scalar compare for index term values.
 const scalarCompare = (x: any, y: any): number => {
   if (x === y) return 0;
@@ -79,8 +83,11 @@ export class TableCacheImpl<
   >;
   private tableDef: TableDefForTableName<RemoteModule, TableName>;
   private emitter: EventEmitter<'insert' | 'delete' | 'update'>;
-  /** The indexes on one column other than the primary key; see `#lookupOn`. */
-  #columnIndexes: ColumnIndex<CachedRow<RemoteModule, TableName>>[] = [];
+  /** One index per column other than the primary key; see `#lookupOn`. */
+  #columnIndexes = new Map<
+    string,
+    ColumnIndex<CachedRow<RemoteModule, TableName>>
+  >();
 
   /**
    * @param name the table name
@@ -157,12 +164,7 @@ export class TableCacheImpl<
       const kLast = key[prefixLen];
 
       // If the last provided is a Range<T>, apply bounds; otherwise equality.
-      if (
-        lastProvided &&
-        typeof lastProvided === 'object' &&
-        'from' in lastProvided &&
-        'to' in lastProvided
-      ) {
+      if (isRange(lastProvided)) {
         // Range<T>
         const from = lastProvided.from as Bound<any>;
         const to = lastProvided.to as Bound<any>;
@@ -228,10 +230,7 @@ export class TableCacheImpl<
     } else {
       const impl: ReadonlyRangedIndex<TableDef, I> = {
         *filter(range: any): IteratorObject<Row, undefined> {
-          const isOneValue =
-            !Array.isArray(range) &&
-            !(range && typeof range === 'object' && 'from' in range);
-          if (lookup && isOneValue) {
+          if (lookup && !Array.isArray(range) && !isRange(range)) {
             yield* lookup(range);
             return;
           }
@@ -246,8 +245,9 @@ export class TableCacheImpl<
 
   /**
    * How an index on `column` looks up one value without scanning the table.
-   * The primary key reads `rows`, which is already keyed by it (see
-   * `Operation.rowId`); any other column gets a `ColumnIndex`.
+   * The primary key reads `rows`, which is already keyed by it: a row's id is
+   * `intoMapKey` of its primary key (see `#parseRowList`). Any other column
+   * gets a `ColumnIndex`, one per column however many indexes name it.
    */
   #lookupOn(
     column: string
@@ -263,11 +263,9 @@ export class TableCacheImpl<
         return entry ? [entry[0]] : [];
       };
     }
-    const index = new ColumnIndex<CachedRow<RemoteModule, TableName>>(
-      column,
-      keyType
-    );
-    this.#columnIndexes.push(index);
+    const index =
+      this.#columnIndexes.get(column) ?? new ColumnIndex(column, keyType);
+    this.#columnIndexes.set(column, index);
     return value => index.rowsWith(value);
   }
 
@@ -275,14 +273,24 @@ export class TableCacheImpl<
     rowId: ComparablePrimitive,
     row: CachedRow<RemoteModule, TableName>
   ): void {
-    for (const index of this.#columnIndexes) index.add(rowId, row);
+    for (const index of this.#columnIndexes.values()) index.add(rowId, row);
+  }
+
+  #updateInIndexes(
+    rowId: ComparablePrimitive,
+    oldRow: CachedRow<RemoteModule, TableName>,
+    newRow: CachedRow<RemoteModule, TableName>
+  ): void {
+    for (const index of this.#columnIndexes.values()) {
+      index.update(rowId, oldRow, newRow);
+    }
   }
 
   #removeFromIndexes(
     rowId: ComparablePrimitive,
     row: CachedRow<RemoteModule, TableName>
   ): void {
-    for (const index of this.#columnIndexes) index.remove(rowId, row);
+    for (const index of this.#columnIndexes.values()) index.remove(rowId, row);
   }
 
   /**
@@ -471,8 +479,7 @@ export class TableCacheImpl<
       return undefined;
     }
     this.rows.set(rowId, [newRow, refCount]);
-    this.#removeFromIndexes(rowId, oldRow);
-    this.#addToIndexes(rowId, newRow);
+    this.#updateInIndexes(rowId, oldRow, newRow);
     if (skipIfIdentical && deepEqual(oldRow, newRow)) {
       // The row is unchanged; the reference count was adjusted above but no
       // callback fires.
@@ -513,8 +520,11 @@ export class TableCacheImpl<
       0,
     ];
     this.rows.set(operation.rowId, [operation.row, previousCount + count]);
-    if (previousCount > 0) this.#removeFromIndexes(operation.rowId, cachedRow);
-    this.#addToIndexes(operation.rowId, operation.row);
+    if (previousCount > 0) {
+      this.#updateInIndexes(operation.rowId, cachedRow, operation.row);
+    } else {
+      this.#addToIndexes(operation.rowId, operation.row);
+    }
     if (previousCount === 0) {
       return {
         type: 'insert',
@@ -558,8 +568,7 @@ export class TableCacheImpl<
       };
     }
     this.rows.set(operation.rowId, [operation.row, previousCount - count]);
-    this.#removeFromIndexes(operation.rowId, cachedRow);
-    this.#addToIndexes(operation.rowId, operation.row);
+    this.#updateInIndexes(operation.rowId, cachedRow, operation.row);
     return undefined;
   };
 

@@ -834,6 +834,23 @@ describe('TableCache', () => {
       expect(iter).not.toHaveBeenCalled();
     });
 
+    test('filter keeps the order a scan gives when a row is held twice or changes in place', () => {
+      const cache = cacheOf([mk(1, 7), mk(2, 7), mk(3, 7)]);
+      const inOrder = () => [...cache.player.filter(7)].map((r: Score) => r.id);
+      const scanned = () =>
+        [...cache.iter()]
+          .filter((r: Score) => r.player === 7)
+          .map((r: Score) => r.id);
+      cache.applyOperations([op('insert', mk(1, 7))], {} as any); // a second subscription
+      cache.applyOperations(
+        [op('delete', mk(2, 7)), op('insert', mk(2, 7, 5))],
+        {} as any
+      ); // an update that keeps its key
+      cache.applyOperations([op('delete', mk(1, 7))], {} as any); // one subscription lets go
+      expect(inOrder()).toEqual([1, 2, 3]);
+      expect(inOrder()).toEqual(scanned());
+    });
+
     test('a key wrapped as a one-element tuple answers as before', () => {
       const cache = cacheOf([mk(1, 7), mk(2, 8)]);
       expect(cache.id.find([2])).toEqual(mk(2, 8));
