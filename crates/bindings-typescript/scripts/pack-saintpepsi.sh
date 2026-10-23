@@ -15,6 +15,8 @@ BASE=2f8905d6aaf3e9ffcbce3a8a1a1e30e715ad5db7 # v2.12.0
 BUNDLES="index.browser.mjs index.cjs index.mjs sdk/index.browser.mjs sdk/index.cjs sdk/index.mjs"
 PKG=$(cd "$(dirname "$0")/.." && pwd)
 OUT=$PWD
+# src/ ships as committed, and the bundles are built from the working tree: they must be the same.
+if [ -n "$(git -C "$PKG" status --porcelain -- src)" ]; then echo "src/ has uncommitted changes" >&2; exit 1; fi
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
@@ -24,7 +26,12 @@ mkdir "$WORK/orig"
 ln -s "$PKG/node_modules" "$WORK/orig/node_modules"
 CHANGED=$(cd "$PKG" && git diff --name-only --relative "$BASE" HEAD -- src)
 for f in $CHANGED; do
-  if git -C "$PKG" cat-file -e "$BASE:./$f" 2>/dev/null; then git -C "$PKG" show "$BASE:./$f" > "$WORK/orig/$f"; else rm "$WORK/orig/$f"; fi
+  if git -C "$PKG" cat-file -e "$BASE:./$f" 2>/dev/null; then
+    mkdir -p "$(dirname "$WORK/orig/$f")"
+    git -C "$PKG" show "$BASE:./$f" > "$WORK/orig/$f"
+  else
+    rm "$WORK/orig/$f"
+  fi
 done
 (cd "$WORK/orig" && npx tsup > "$WORK/tsup-orig.log" 2>&1)
 (cd "$PKG" && rm -rf dist && npx tsup > "$WORK/tsup-fixed.log" 2>&1)
@@ -32,11 +39,18 @@ done
 # npm's package, with the branch's src files and the bundles' differences laid on it.
 (cd "$WORK" && npm pack -q spacetimedb@2.12.0 > /dev/null && tar xzf spacetimedb-2.12.0.tgz)
 for f in $CHANGED; do
-  if [ -e "$PKG/$f" ]; then cp "$PKG/$f" "$WORK/package/$f"; else rm "$WORK/package/$f"; fi
+  if [ -e "$PKG/$f" ]; then mkdir -p "$(dirname "$WORK/package/$f")" && cp "$PKG/$f" "$WORK/package/$f"; else rm "$WORK/package/$f"; fi
 done
 for f in $BUNDLES; do
-  diff -u "$WORK/orig/dist/$f" "$PKG/dist/$f" | sed "1s|.*|--- a/dist/$f|;2s|.*|+++ b/dist/$f|" > "$WORK/bundle.diff" || true
-  (cd "$WORK/package" && patch -p1 -s --no-backup-if-mismatch < "$WORK/bundle.diff")
+  # diff exits 1 when the files differ, 2 on trouble; a bundle the change leaves alone is a mistake here
+  status=0
+  diff -u "$WORK/orig/dist/$f" "$PKG/dist/$f" > "$WORK/bundle.diff" || status=$?
+  if [ "$status" -ne 1 ]; then echo "dist/$f: diff exited $status, expected a change" >&2; exit 1; fi
+  sed -i "1s|.*|--- a/dist/$f|;2s|.*|+++ b/dist/$f|" "$WORK/bundle.diff"
+  # no fuzz: npm's bundle must match the v2.12.0 build exactly where the change lands. An offset
+  # is fine (npm's build sits a few lines from a local one), a context that differs is not.
+  (cd "$WORK/package" && patch -p1 --fuzz=0 --no-backup-if-mismatch < "$WORK/bundle.diff" > "$WORK/patch.log") \
+    || { cat "$WORK/patch.log" >&2; exit 1; }
 done
 (cd "$WORK/package" && node -e '
 const fs = require("fs"), p = JSON.parse(fs.readFileSync("package.json", "utf8"));
