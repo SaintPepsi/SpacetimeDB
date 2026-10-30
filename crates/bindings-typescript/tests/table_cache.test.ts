@@ -1,5 +1,15 @@
 import { describe, expect, test, vi } from 'vitest';
-import { AlgebraicType, Identity, schema, t, table, type Infer } from '../src';
+import {
+  AlgebraicType,
+  ConnectionId,
+  Identity,
+  schema,
+  t,
+  table,
+  Timestamp,
+  Uuid,
+  type Infer,
+} from '../src';
 import { type Operation, TableCacheImpl } from '../src/sdk/table_cache';
 import { tables } from '../test-app/src/module_bindings/index.ts';
 import { Player } from '../test-app/src/module_bindings/types';
@@ -859,48 +869,220 @@ describe('TableCache', () => {
       expect(cache.name.find('score 1')).toEqual(renamed);
     });
 
-    test('find on a unique array column takes the array as the value', () => {
-      const { tagged } = schema({
-        tagged: table(
-          {
-            name: 'tagged',
-            indexes: [
-              {
-                accessor: 'tags',
-                name: 'tagged_tags_idx_btree',
-                algorithm: 'btree',
-                columns: ['tags'],
-              },
-            ],
-            constraints: [
-              {
-                name: 'tagged_tags_key',
-                constraint: 'unique',
-                columns: ['tags'],
-              },
-            ],
-          },
-          t.row({ id: t.u32().primaryKey(), tags: t.array(t.string()) })
-        ),
-      }).schemaType.tables;
-      const cache: any = new TableCacheImpl(tagged as any);
-      const one = { id: 1, tags: ['a', 'b'] };
-      const two = { id: 2, tags: ['ab'] };
-      cache.applyOperations(
-        [one, two].map(row => ({ type: 'insert', rowId: row.id, row })),
-        {} as any
-      );
-      expect(cache.tags.find(['a', 'b'])).toEqual(one);
-      expect(cache.tags.find(['ab'])).toEqual(two);
-      expect(cache.tags.find(['b'])).toBeNull();
-    });
-
     test('a key wrapped as a one-element tuple answers as before', () => {
       const cache = cacheOf([mk(1, 7), mk(2, 8)]);
       expect(cache.id.find([2])).toEqual(mk(2, 8));
       expect(cache.name.find(['score 1'])).toEqual(mk(1, 7));
       expect(cache.id.find([1, 2])).toBeNull();
       expect(ids(cache.player.filter([7]))).toEqual([1]);
+    });
+
+    // Every column type a module can index (spacetimedb_lib's
+    // `FilterableValue`), as the Rust SDK's unique_test_table.rs covers each.
+    // A lookup takes a value equal to the stored one, not the same object.
+    const Color = t.enum('Color', ['red', 'green']);
+    const keyTypes: {
+      name: string;
+      column: () => any;
+      a: () => unknown;
+      b: () => unknown;
+    }[] = [
+      { name: 'u8', column: () => t.u8(), a: () => 1, b: () => 255 },
+      { name: 'i32', column: () => t.i32(), a: () => -5, b: () => 5 },
+      {
+        name: 'u64',
+        column: () => t.u64(),
+        a: () => 1n,
+        b: () => 2n ** 64n - 1n,
+      },
+      { name: 'i64', column: () => t.i64(), a: () => -1n, b: () => 1n },
+      {
+        name: 'u128',
+        column: () => t.u128(),
+        a: () => 1n,
+        b: () => 2n ** 128n - 1n,
+      },
+      {
+        name: 'i128',
+        column: () => t.i128(),
+        a: () => -(2n ** 127n),
+        b: () => 0n,
+      },
+      {
+        name: 'u256',
+        column: () => t.u256(),
+        a: () => 0n,
+        b: () => 2n ** 256n - 1n,
+      },
+      {
+        name: 'i256',
+        column: () => t.i256(),
+        a: () => -1n,
+        b: () => 2n ** 255n - 1n,
+      },
+      { name: 'bool', column: () => t.bool(), a: () => false, b: () => true },
+      {
+        name: 'string',
+        column: () => t.string(),
+        a: () => '',
+        b: () => 'é 🦀',
+      },
+      {
+        name: 'Identity',
+        column: () => t.identity(),
+        a: () => new Identity(1n),
+        b: () => new Identity(2n ** 256n - 1n),
+      },
+      {
+        name: 'ConnectionId',
+        column: () => t.connectionId(),
+        a: () => new ConnectionId(1n),
+        b: () => new ConnectionId(2n ** 128n - 1n),
+      },
+      {
+        name: 'Uuid',
+        column: () => t.uuid(),
+        a: () => new Uuid(1n),
+        b: () => new Uuid(2n ** 128n - 1n),
+      },
+      {
+        name: 'Timestamp',
+        column: () => t.timestamp(),
+        a: () => new Timestamp(-1n),
+        b: () => new Timestamp(1_700_000_000_000_000n),
+      },
+      {
+        name: 'plain enum',
+        column: () => Color,
+        a: () => ({ tag: 'red' }),
+        b: () => ({ tag: 'green' }),
+      },
+    ];
+    for (const { name, column, a, b } of keyTypes) {
+      test(`find and filter on a ${name} column read the index`, () => {
+        const { keyed } = schema({
+          keyed: table(
+            {
+              name: 'keyed',
+              indexes: [
+                {
+                  accessor: 'unique',
+                  name: 'keyed_unique_idx_btree',
+                  algorithm: 'btree',
+                  columns: ['unique'],
+                },
+                {
+                  accessor: 'shared',
+                  name: 'keyed_shared_idx_btree',
+                  algorithm: 'btree',
+                  columns: ['shared'],
+                },
+              ],
+              constraints: [
+                {
+                  name: 'keyed_unique_key',
+                  constraint: 'unique',
+                  columns: ['unique'],
+                },
+              ],
+            },
+            t.row({
+              id: t.u32().primaryKey(),
+              unique: column(),
+              shared: column(),
+            })
+          ),
+        }).schemaType.tables;
+        const cache: any = new TableCacheImpl(keyed as any);
+        // two rows, as a bool has only two values
+        const rows = [
+          { id: 1, unique: a(), shared: a() },
+          { id: 2, unique: b(), shared: a() },
+        ];
+        cache.applyOperations(
+          rows.map(row => ({ type: 'insert', rowId: row.id, row })),
+          {} as any
+        );
+        const iter = vi.spyOn(cache, 'iter');
+        expect(cache.unique.find(a())).toBe(rows[0]);
+        expect(cache.unique.find(b())).toBe(rows[1]);
+        expect(ids(cache.shared.filter(a()))).toEqual([1, 2]);
+        expect(ids(cache.shared.filter(b()))).toEqual([]);
+        expect(iter).not.toHaveBeenCalled();
+
+        cache.applyOperations(
+          [
+            {
+              type: 'delete',
+              rowId: 1,
+              row: { id: 1, unique: a(), shared: a() },
+            },
+          ],
+          {} as any
+        );
+        expect(cache.unique.find(a())).toBeNull();
+        expect(cache.unique.find(b())).toBe(rows[1]);
+        expect(ids(cache.shared.filter(a()))).toEqual([2]);
+      });
+    }
+
+    test('a row reconnect finds unchanged keeps the index in step with the cache', () => {
+      // Reconnecting replays the subscription as a delete of every cached row
+      // and an insert of each row the server still has; an unchanged row is an
+      // update that fires no callback, but the cache now holds the new object
+      // and the indexes must too, or a later delete leaves the old one behind.
+      const cache = cacheOf([mk(1, 7), mk(2, 7)]);
+      const replayed = [mk(1, 7), mk(2, 7)];
+      const callbacks = cache.applyOperations(
+        [
+          op('delete', mk(1, 7)),
+          op('delete', mk(2, 7)),
+          ...replayed.map(r => op('insert', r)),
+        ],
+        {} as any,
+        { skipIdenticalUpdates: true }
+      );
+      expect(callbacks).toEqual([]);
+      expect(cache.id.find(1)).toBe(replayed[0]);
+      expect(cache.name.find('score 2')).toBe(replayed[1]);
+      expect([...cache.player.filter(7)]).toEqual(replayed);
+
+      cache.applyOperations([op('delete', mk(1, 7))], {} as any);
+      expect(cache.id.find(1)).toBeNull();
+      expect(cache.name.find('score 1')).toBeNull();
+      expect(ids(cache.player.filter(7))).toEqual([2]);
+    });
+
+    test('a row reconnect finds changed moves in every index', () => {
+      const cache = cacheOf([mk(1, 7)]);
+      const moved = { ...mk(1, 8), name: 'renamed' };
+      cache.applyOperations(
+        [op('delete', mk(1, 7)), op('insert', moved)],
+        {} as any,
+        { skipIdenticalUpdates: true }
+      );
+      expect(cache.id.find(1)).toBe(moved);
+      expect(cache.name.find('renamed')).toBe(moved);
+      expect(cache.name.find('score 1')).toBeNull();
+      expect(ids(cache.player.filter(7))).toEqual([]);
+      expect(ids(cache.player.filter(8))).toEqual([1]);
+    });
+
+    test('two rows swapping unique values by updates in one transaction', () => {
+      const cache = cacheOf([mk(1, 7), mk(2, 7)]);
+      const one = { ...mk(1, 7), name: 'score 2' };
+      const two = { ...mk(2, 7), name: 'score 1' };
+      cache.applyOperations(
+        [
+          op('delete', mk(1, 7)),
+          op('delete', mk(2, 7)),
+          op('insert', one),
+          op('insert', two),
+        ],
+        {} as any
+      );
+      expect(cache.name.find('score 1')).toBe(two);
+      expect(cache.name.find('score 2')).toBe(one);
     });
 
     test('an index on a table without a primary key', () => {

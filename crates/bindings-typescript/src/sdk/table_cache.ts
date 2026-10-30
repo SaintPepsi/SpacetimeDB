@@ -75,8 +75,7 @@ export type TableCache<
 export class TableCacheImpl<
   RemoteModule extends UntypedRemoteModule,
   TableName extends TableNamesOf<RemoteModule>,
-> implements ClientTableCoreImplementable<RemoteModule, TableName>
-{
+> implements ClientTableCoreImplementable<RemoteModule, TableName> {
   private readonly hasPrimaryKey: boolean;
   private rows: Map<
     ComparablePrimitive,
@@ -230,10 +229,11 @@ export class TableCacheImpl<
       const impl: ReadonlyUniqueIndex<TableDef, I> = {
         find: (colVal: any): Row | null => {
           if (index) {
-            // An array column's value is itself an array. Any other column's
-            // value may also come wrapped as a one-element tuple, which the
-            // scan below accepts.
-            if (keyType?.tag === 'Array' || !Array.isArray(colVal)) {
+            // The value may also come wrapped as a one-element tuple, which
+            // the scan below accepts. No column the module can index holds an
+            // array (spacetimedb_lib's `FilterableValue`), so an array is
+            // always a tuple here.
+            if (!Array.isArray(colVal)) {
               return index.find(colVal) as Row | null;
             }
             return colVal.length === 1
