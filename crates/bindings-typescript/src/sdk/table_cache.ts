@@ -4,6 +4,7 @@ import { stdbLogger } from './logger.ts';
 import { deepEqual, type ComparablePrimitive } from '../';
 import {
   BTreeIndex,
+  keyRuleFor,
   UniqueIndex,
   type InternalTableEvents,
 } from './client_index.ts';
@@ -90,9 +91,16 @@ export class TableCacheImpl<
   // before any user callback.
   #internalInsertListeners: ((row: CachedRow) => void)[] = [];
   #internalDeleteListeners: ((row: CachedRow) => void)[] = [];
+  #internalReplaceListeners: ((
+    oldRow: CachedRow,
+    newRow: CachedRow
+  ) => void)[] = [];
   #internalEvents: InternalTableEvents<CachedRow> = {
     onInternalInsert: listener => this.#internalInsertListeners.push(listener),
     onInternalDelete: listener => this.#internalDeleteListeners.push(listener),
+    onInternalReplace: listener =>
+      this.#internalReplaceListeners.push(listener),
+    rows: () => this.iter(),
   };
 
   /**
@@ -215,28 +223,28 @@ export class TableCacheImpl<
 
     // eslint-disable-next-line @typescript-eslint/no-this-alias
     const self = this;
-    // A one-column index keeps its rows by value, as the C# SDK's do.
-    // Multi-column indexes still scan.
+    // A one-column index keeps its rows by value, as the C# SDK's do, on the
+    // column types `keyRuleFor` keys. Multi-column indexes and the other
+    // column types still scan.
     const column = columns.length === 1 ? columns[0] : undefined;
     const keyType =
       column === undefined
         ? undefined
         : tableDef.columns[column]?.typeBuilder.algebraicType;
+    const rule = keyType === undefined ? undefined : keyRuleFor(keyType);
     if (isUnique) {
       const index =
-        column === undefined || keyType === undefined
+        column === undefined || rule === undefined
           ? undefined
-          : new UniqueIndex(this.#internalEvents, column, keyType);
+          : new UniqueIndex(this.#internalEvents, column, rule);
       const impl: ReadonlyUniqueIndex<TableDef, I> = {
         find: (colVal: any): Row | null => {
           if (index) {
-            // An array column's value is itself an array. Any other column's
-            // value may also come wrapped as a one-element tuple, which the
-            // scan below accepts.
-            if (keyType?.tag === 'Array' || !Array.isArray(colVal)) {
-              return index.find(colVal) as Row | null;
-            }
-            return colVal.length === 1
+            // The key is one value, so the scan below matches nothing else:
+            // a bare value, or one wrapped as `[value]`.
+            if (!Array.isArray(colVal)) return index.find(colVal) as Row | null;
+            // `deepEqual` also counts any other own key the array carries
+            return colVal.length === 1 && Object.keys(colVal).length === 1
               ? (index.find(colVal[0]) as Row | null)
               : null;
           }
@@ -251,18 +259,20 @@ export class TableCacheImpl<
       return impl as ReadonlyIndex<TableDef, I>;
     } else {
       const index =
-        column === undefined || keyType === undefined
+        column === undefined || rule === undefined
           ? undefined
-          : new BTreeIndex(this.#internalEvents, column, keyType);
+          : new BTreeIndex(this.#internalEvents, column, rule);
+      function* scan(range: any): IteratorObject<Row, undefined> {
+        for (const row of self.iter()) {
+          if (matchRange(row, range)) yield row;
+        }
+      }
       const impl: ReadonlyRangedIndex<TableDef, I> = {
-        *filter(range: any): IteratorObject<Row, undefined> {
+        filter(range: any): IteratorObject<Row, undefined> {
           if (index && !Array.isArray(range) && !isRange(range)) {
-            yield* index.filter(range) as Iterable<Row>;
-            return;
+            return index.filter(range) as IteratorObject<Row, undefined>;
           }
-          for (const row of self.iter()) {
-            if (matchRange(row, range)) yield row;
-          }
+          return scan(range);
         },
       };
       return impl as ReadonlyIndex<TableDef, I>;
@@ -275,6 +285,13 @@ export class TableCacheImpl<
 
   #internalDelete(row: CachedRow): void {
     for (const listener of this.#internalDeleteListeners) listener(row);
+  }
+
+  #internalReplace(oldRow: CachedRow, newRow: CachedRow): void {
+    if (oldRow === newRow) return;
+    for (const listener of this.#internalReplaceListeners) {
+      listener(oldRow, newRow);
+    }
   }
 
   /**
@@ -463,8 +480,7 @@ export class TableCacheImpl<
       return undefined;
     }
     this.rows.set(rowId, [newRow, refCount]);
-    this.#internalDelete(oldRow);
-    this.#internalInsert(newRow);
+    this.#internalReplace(oldRow, newRow);
     if (skipIfIdentical && deepEqual(oldRow, newRow)) {
       // The row is unchanged; the reference count was adjusted above but no
       // callback fires.
@@ -504,9 +520,12 @@ export class TableCacheImpl<
       operation.row,
       0,
     ];
-    // A row another subscription already holds keeps its cached object, the
-    // one the indexes hold.
-    this.rows.set(operation.rowId, [cachedRow, previousCount + count]);
+    this.rows.set(operation.rowId, [operation.row, previousCount + count]);
+    if (previousCount > 0) {
+      // The cache now holds the new copy of a row another subscription
+      // already had, so the indexes must too.
+      this.#internalReplace(cachedRow, operation.row);
+    }
     if (previousCount === 0) {
       this.#internalInsert(operation.row);
       return {
@@ -550,7 +569,9 @@ export class TableCacheImpl<
         },
       };
     }
-    this.rows.set(operation.rowId, [cachedRow, previousCount - count]);
+    this.rows.set(operation.rowId, [operation.row, previousCount - count]);
+    // as on insert: the indexes follow the copy the cache now holds
+    this.#internalReplace(cachedRow, operation.row);
     return undefined;
   };
 
