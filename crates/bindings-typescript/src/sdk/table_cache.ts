@@ -237,7 +237,8 @@ export class TableCacheImpl<
             // The key is one value, so the scan below matches nothing else:
             // a bare value, or one wrapped as `[value]`.
             if (!Array.isArray(colVal)) return index.find(colVal) as Row | null;
-            return colVal.length === 1
+            // `deepEqual` also counts any other own key the array carries
+            return colVal.length === 1 && Object.keys(colVal).length === 1
               ? (index.find(colVal[0]) as Row | null)
               : null;
           }
@@ -507,9 +508,13 @@ export class TableCacheImpl<
       operation.row,
       0,
     ];
-    // A row another subscription already holds keeps its cached object, the
-    // one the indexes hold.
-    this.rows.set(operation.rowId, [cachedRow, previousCount + count]);
+    this.rows.set(operation.rowId, [operation.row, previousCount + count]);
+    if (previousCount > 0) {
+      // The cache now holds the new copy of a row another subscription
+      // already had, so the indexes must too.
+      this.#internalDelete(cachedRow);
+      this.#internalInsert(operation.row);
+    }
     if (previousCount === 0) {
       this.#internalInsert(operation.row);
       return {
@@ -553,7 +558,10 @@ export class TableCacheImpl<
         },
       };
     }
-    this.rows.set(operation.rowId, [cachedRow, previousCount - count]);
+    this.rows.set(operation.rowId, [operation.row, previousCount - count]);
+    // as on insert: the indexes follow the copy the cache now holds
+    this.#internalDelete(cachedRow);
+    this.#internalInsert(operation.row);
     return undefined;
   };
 

@@ -846,15 +846,20 @@ describe('TableCache', () => {
       expect(iter).not.toHaveBeenCalled();
     });
 
-    test('a row a second subscription also holds stays as it was, in the cache and its index', () => {
+    test('a row a second subscription also holds: the indexes hold the copy the cache holds', () => {
       const cache = cacheOf([mk(1, 7), mk(2, 7)]);
-      const held = cache.id.find(1);
-      cache.applyOperations([op('insert', mk(1, 7))], {} as any); // a second subscription
-      cache.applyOperations([op('delete', mk(1, 7))], {} as any); // one lets go
-      expect(cache.id.find(1)).toBe(held);
-      expect([...cache.player.filter(7)].map((r: Score) => r.id)).toEqual([
-        1, 2,
-      ]);
+      const second = mk(1, 7);
+      cache.applyOperations([op('insert', second)], {} as any); // a second subscription
+      // the cache keeps the copy that came last, as the stock cache does
+      expect(cache.id.find(1)).toBe(second);
+      expect(cache.id.find(1)).toBe([...cache.iter()][0]);
+      const released = mk(1, 7);
+      cache.applyOperations([op('delete', released)], {} as any); // one lets go
+      expect(cache.id.find(1)).toBe(released);
+      expect(cache.name.find('score 1')).toBe(released);
+      expect(
+        [...cache.player.filter(7)].map((r: Score) => r.id).sort()
+      ).toEqual([1, 2]);
       cache.applyOperations([op('delete', mk(1, 7))], {} as any); // the other lets go
       expect(ids(cache.player.filter(7))).toEqual([2]);
       expect(cache.id.find(1)).toBeNull();
@@ -877,6 +882,8 @@ describe('TableCache', () => {
       expect(cache.name.find(['score 1'])).toEqual(mk(1, 7));
       expect(cache.id.find([1, 2])).toBeNull();
       expect(ids(cache.player.filter([7]))).toEqual([1]);
+      // the scan's `deepEqual` counts the tuple's other own keys
+      expect(cache.id.find(Object.assign([2], { more: 1 }))).toBeNull();
     });
 
     // Every column type the Rust SDK's unique_test_table.rs covers, and the
@@ -1235,10 +1242,22 @@ describe('TableCache', () => {
         lookups: [1, 1.5, '1', null, undefined],
       },
       {
+        name: 'an option of unit',
+        type: () => t.option(t.unit()),
+        values: [{}, undefined],
+        lookups: [{}, undefined, null, { tag: 'some', value: {} }],
+      },
+      {
+        name: 'a result of units',
+        type: () => t.result(t.unit(), t.unit()),
+        values: [{ ok: {} }, { err: {} }],
+        lookups: [{ ok: {} }, { err: {} }, { tag: 'ok', value: {} }, {}],
+      },
+      {
         name: 'an f64',
         type: () => t.f64(),
         values: [0, -0, NaN, 1.5],
-        lookups: [0, -0, NaN, 1.5, '1.5'],
+        lookups: [0, -0, NaN, 1.5, '1.5', undefined, null],
       },
     ];
     for (const { name, type, values, lookups } of hazards) {
@@ -1312,9 +1331,18 @@ describe('TableCache', () => {
       cache.applyOperations([{ type: 'insert', rowId: 1, row }], {} as any);
       const plain = { __identity__: owner.__identity__ };
       const extra = { __identity__: owner.__identity__, more: 1 };
+      const extraOnInstance = Object.assign(new Identity(owner.__identity__), {
+        more: 1,
+      });
+      const posing = {
+        __identity__: owner.__identity__,
+        constructor: Identity,
+      };
       for (const lookup of [
         plain,
         extra,
+        extraOnInstance,
+        posing,
         owner.__identity__,
         null,
         undefined,

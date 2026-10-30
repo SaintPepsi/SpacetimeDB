@@ -1,12 +1,4 @@
-import {
-  ConnectionId,
-  deepEqual,
-  Identity,
-  TimeDuration,
-  Timestamp,
-  Uuid,
-  type AlgebraicType,
-} from '../';
+import { deepEqual, type AlgebraicType } from '../';
 
 /**
  * What an index reads of the cached table. The table cache calls the
@@ -58,13 +50,6 @@ const SELF_KEYED = new Set<AlgebraicType['tag']>([
  * `TimeDuration` (`AlgebraicType.intoMapKey` keys them by it too). The
  * deserializer makes each an instance with that field as its only own key.
  */
-const SPECIAL_CLASSES = new Set<unknown>([
-  Identity,
-  ConnectionId,
-  Timestamp,
-  Uuid,
-  TimeDuration,
-]);
 const SPECIAL_FIELDS = new Set([
   '__identity__',
   '__connection_id__',
@@ -73,8 +58,11 @@ const SPECIAL_FIELDS = new Set([
   '__time_duration_micros__',
 ]);
 
+/** The key stored NaN rows share: no lookup has it, as `NaN === NaN` is false. */
+const NAN_ROWS = Symbol('NaN rows');
+
 const selfKeyed: KeyRule = {
-  keyOf: value => (value !== value ? undefined : value),
+  keyOf: value => (value !== value ? NAN_ROWS : value),
   exact: () => true,
 };
 
@@ -87,7 +75,6 @@ function specialKeyed(field: string): KeyRule {
     // A stored value's only own key is `field`, so a lookup equals every row
     // in its group exactly when that is its only own key too.
     exact: value => {
-      if (SPECIAL_CLASSES.has((value as object).constructor)) return true;
       const keys = Object.keys(value as object);
       return keys.length === 1 && keys[0] === field;
     },
@@ -123,6 +110,14 @@ export function keyRuleFor(type: AlgebraicType): KeyRule | undefined {
     return undefined;
   }
   if (type.tag === 'Sum') {
+    // The deserializer gives an option (`some`/`none`) and a result
+    // (`ok`/`err`) shapes of their own, with no `tag`.
+    const [first, second, ...more] = type.value.variants;
+    const special =
+      more.length === 0 &&
+      ((first?.name === 'some' && second?.name === 'none') ||
+        (first?.name === 'ok' && second?.name === 'err'));
+    if (special) return undefined;
     const plain = type.value.variants.every(
       variant =>
         variant.algebraicType.tag === 'Product' &&
