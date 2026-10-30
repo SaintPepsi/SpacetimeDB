@@ -2,10 +2,12 @@ import { describe, expect, test, vi } from 'vitest';
 import {
   AlgebraicType,
   ConnectionId,
+  deepEqual,
   Identity,
   schema,
   t,
   table,
+  TimeDuration,
   Timestamp,
   Uuid,
   type Infer,
@@ -877,9 +879,9 @@ describe('TableCache', () => {
       expect(ids(cache.player.filter([7]))).toEqual([1]);
     });
 
-    // Every column type a module can index (spacetimedb_lib's
-    // `FilterableValue`), as the Rust SDK's unique_test_table.rs covers each.
-    // A lookup takes a value equal to the stored one, not the same object.
+    // Every column type the Rust SDK's unique_test_table.rs covers, and the
+    // TS builders that are `Indexable`. A lookup takes a value equal to the
+    // stored one, not the same object.
     const Color = t.enum('Color', ['red', 'green']);
     const keyTypes: {
       name: string;
@@ -888,6 +890,9 @@ describe('TableCache', () => {
       b: () => unknown;
     }[] = [
       { name: 'u8', column: () => t.u8(), a: () => 1, b: () => 255 },
+      { name: 'u16', column: () => t.u16(), a: () => 0, b: () => 65535 },
+      { name: 'i8', column: () => t.i8(), a: () => -128, b: () => 127 },
+      { name: 'i16', column: () => t.i16(), a: () => -1, b: () => 1 },
       { name: 'i32', column: () => t.i32(), a: () => -5, b: () => 5 },
       {
         name: 'u64',
@@ -952,10 +957,17 @@ describe('TableCache', () => {
         b: () => new Timestamp(1_700_000_000_000_000n),
       },
       {
+        name: 'TimeDuration',
+        column: () => t.timeDuration(),
+        a: () => new TimeDuration(0n),
+        b: () => new TimeDuration(-60_000_000n),
+      },
+      {
         name: 'plain enum',
         column: () => Color,
-        a: () => ({ tag: 'red' }),
-        b: () => ({ tag: 'green' }),
+        // the shape the sum deserializer gives a unit variant
+        a: () => ({ tag: 'red', value: {} }),
+        b: () => ({ tag: 'green', value: {} }),
       },
     ];
     for (const { name, column, a, b } of keyTypes) {
@@ -1053,19 +1065,76 @@ describe('TableCache', () => {
       expect(ids(cache.player.filter(7))).toEqual([2]);
     });
 
-    test('a row reconnect finds changed moves in every index', () => {
-      const cache = cacheOf([mk(1, 7)]);
-      const moved = { ...mk(1, 8), name: 'renamed' };
+    test('reconnect on a table without a primary key: an unchanged row stays, a changed one moves', () => {
+      // Without a primary key a row's id is the row itself, so reconnect's
+      // replay pairs only an identical row into an update; a changed row is a
+      // delete of the old id and an insert of the new one.
+      const { tally } = schema({
+        tally: table(
+          {
+            name: 'tally',
+            indexes: [
+              {
+                accessor: 'player',
+                name: 'tally_player_idx_btree',
+                algorithm: 'btree',
+                columns: ['player'],
+              },
+              {
+                accessor: 'label',
+                name: 'tally_label_idx_btree',
+                algorithm: 'btree',
+                columns: ['label'],
+              },
+            ],
+            constraints: [
+              {
+                name: 'tally_label_key',
+                constraint: 'unique',
+                columns: ['label'],
+              },
+            ],
+          },
+          t.row({ player: t.u32(), label: t.string() })
+        ),
+      }).schemaType.tables;
+      const cache: any = new TableCacheImpl(tally as any);
+      const tallyOp = (type: 'insert' | 'delete', row: object) => ({
+        type,
+        rowId: JSON.stringify(row),
+        row,
+      });
       cache.applyOperations(
-        [op('delete', mk(1, 7)), op('insert', moved)],
+        [
+          tallyOp('insert', { player: 7, label: 'kept' }),
+          tallyOp('insert', { player: 7, label: 'changed' }),
+        ],
+        {} as any
+      );
+      const kept = { player: 7, label: 'kept' };
+      const changed = { player: 8, label: 'changed' };
+      const callbacks = cache.applyOperations(
+        [
+          tallyOp('delete', { player: 7, label: 'kept' }),
+          tallyOp('delete', { player: 7, label: 'changed' }),
+          tallyOp('insert', kept),
+          tallyOp('insert', changed),
+        ],
         {} as any,
         { skipIdenticalUpdates: true }
       );
-      expect(cache.id.find(1)).toBe(moved);
-      expect(cache.name.find('renamed')).toBe(moved);
-      expect(cache.name.find('score 1')).toBeNull();
-      expect(ids(cache.player.filter(7))).toEqual([]);
-      expect(ids(cache.player.filter(8))).toEqual([1]);
+      expect(callbacks.map((cb: { type: string }) => cb.type).sort()).toEqual([
+        'delete',
+        'insert',
+      ]);
+      expect(cache.label.find('kept')).toBe(kept);
+      expect(cache.label.find('changed')).toBe(changed);
+      expect([...cache.player.filter(7)]).toEqual([kept]);
+      expect([...cache.player.filter(8)]).toEqual([changed]);
+
+      cache.applyOperations([tallyOp('delete', kept)], {} as any);
+      expect(cache.label.find('kept')).toBeNull();
+      expect([...cache.player.filter(7)]).toEqual([]);
     });
 
     test('two rows swapping unique values by updates in one transaction', () => {
@@ -1084,6 +1153,127 @@ describe('TableCache', () => {
       expect(cache.name.find('score 1')).toBe(two);
       expect(cache.name.find('score 2')).toBe(one);
     });
+
+    // A table with a unique and a BTree index on one column of `type`.
+    const indexedOn = (type: any) => {
+      const { probe } = schema({
+        probe: table(
+          {
+            name: 'probe',
+            indexes: [
+              {
+                accessor: 'unique',
+                name: 'probe_unique_idx_btree',
+                algorithm: 'btree',
+                columns: ['unique'],
+              },
+              {
+                accessor: 'shared',
+                name: 'probe_shared_idx_btree',
+                algorithm: 'btree',
+                columns: ['shared'],
+              },
+            ],
+            constraints: [
+              {
+                name: 'probe_unique_key',
+                constraint: 'unique',
+                columns: ['unique'],
+              },
+            ],
+          },
+          t.row({ id: t.u32().primaryKey(), unique: type, shared: type })
+        ),
+      }).schemaType.tables;
+      return new TableCacheImpl(probe as any) as any;
+    };
+    // What the scan the index replaced answers (`find` takes the full key
+    // as a tuple, or a bare value; `filter` one value).
+    const scanFind = (cache: any, colVal: unknown) => {
+      const expected = Array.isArray(colVal) ? colVal : [colVal];
+      return (
+        [...cache.iter()].find((row: any) =>
+          deepEqual([row.unique], expected)
+        ) ?? null
+      );
+    };
+    const scanFilter = (cache: any, value: unknown) =>
+      [...cache.iter()].filter((row: any) => deepEqual(row.shared, value));
+
+    // Columns a module can index through `indexes:` whose map keys come from
+    // the serializer, which coerces what it is given; and floats, where a Map
+    // and `===` disagree on NaN.
+    const Point = t.object('Point', { x: t.u32() });
+    const hazards: {
+      name: string;
+      type: () => any;
+      values: unknown[];
+      lookups: unknown[];
+    }[] = [
+      {
+        name: 'an array of strings',
+        type: () => t.array(t.string()),
+        values: [['a', 'b'], ['ab']],
+        lookups: ['ab', ['a', 'b'], [['a', 'b']], [['ab']], ['ab'], [[]]],
+      },
+      {
+        name: 'an array of u32',
+        type: () => t.array(t.u32()),
+        values: [[1, 2], [0]],
+        lookups: [[[1, 2]], [[0]], [1, 2], [0], [[1.5, 2]]],
+      },
+      {
+        name: 'a struct',
+        type: () => Point,
+        values: [{ x: 1 }, { x: 2 }],
+        lookups: [{ x: 1 }, { x: 1.9 }, { x: '1' }, { x: 1, y: 0 }],
+      },
+      {
+        name: 'an option',
+        type: () => t.option(t.u32()),
+        values: [1, undefined],
+        lookups: [1, 1.5, '1', null, undefined],
+      },
+      {
+        name: 'an f64',
+        type: () => t.f64(),
+        values: [0, -0, NaN, 1.5],
+        lookups: [0, -0, NaN, 1.5, '1.5'],
+      },
+    ];
+    for (const { name, type, values, lookups } of hazards) {
+      test(`on ${name} column, every lookup answers as the scan did`, () => {
+        const cache = indexedOn(type());
+        const rows = values.map((value, i) => ({
+          id: i + 1,
+          unique: value,
+          shared: value,
+        }));
+        cache.applyOperations(
+          rows.map(row => ({ type: 'insert', rowId: row.id, row })),
+          {} as any
+        );
+        const check = () => {
+          for (const lookup of lookups) {
+            expect(cache.unique.find(lookup)).toBe(scanFind(cache, lookup));
+            if (!Array.isArray(lookup)) {
+              expect([...cache.shared.filter(lookup)]).toEqual(
+                scanFilter(cache, lookup)
+              );
+            }
+          }
+        };
+        check();
+        // and after each row leaves in turn
+        for (const row of rows) {
+          cache.applyOperations(
+            [{ type: 'delete', rowId: row.id, row: { ...row } }],
+            {} as any
+          );
+          check();
+        }
+      });
+    }
 
     test('an index on a table without a primary key', () => {
       const { tally } = schema({

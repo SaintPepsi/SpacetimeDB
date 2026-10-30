@@ -75,7 +75,8 @@ export type TableCache<
 export class TableCacheImpl<
   RemoteModule extends UntypedRemoteModule,
   TableName extends TableNamesOf<RemoteModule>,
-> implements ClientTableCoreImplementable<RemoteModule, TableName> {
+> implements ClientTableCoreImplementable<RemoteModule, TableName>
+{
   private readonly hasPrimaryKey: boolean;
   private rows: Map<
     ComparablePrimitive,
@@ -228,20 +229,15 @@ export class TableCacheImpl<
           : new UniqueIndex(this.#internalEvents, column, keyType);
       const impl: ReadonlyUniqueIndex<TableDef, I> = {
         find: (colVal: any): Row | null => {
-          if (index) {
-            // The value may also come wrapped as a one-element tuple, which
-            // the scan below accepts. No column the module can index holds an
-            // array (spacetimedb_lib's `FilterableValue`), so an array is
-            // always a tuple here.
-            if (!Array.isArray(colVal)) {
-              return index.find(colVal) as Row | null;
-            }
-            return colVal.length === 1
-              ? (index.find(colVal[0]) as Row | null)
-              : null;
-          }
           // For unique btree, caller supplies the *full* key (tuple if multi-col).
           const expected = Array.isArray(colVal) ? colVal : [colVal];
+          if (index) {
+            // The key is one value, so the scan below matches nothing else;
+            // as there, an array column's value comes wrapped as `[value]`.
+            return expected.length === 1
+              ? (index.find(expected[0]) as Row | null)
+              : null;
+          }
           for (const row of self.iter()) {
             if (deepEqual(getKey(row), expected)) return row;
           }
