@@ -1,20 +1,39 @@
-import { AlgebraicType, deepEqual, type ComparablePrimitive } from '../';
+import {
+  ConnectionId,
+  deepEqual,
+  Identity,
+  TimeDuration,
+  Timestamp,
+  Uuid,
+  type AlgebraicType,
+} from '../';
 
 /**
- * Where an index hears about rows entering and leaving the client cache.
- * The table cache calls these listeners after it changes its own rows; an
- * update is a delete of the old row and an insert of the new one.
+ * What an index reads of the cached table. The table cache calls the
+ * listeners after it changes its own rows; an update is a delete of the old
+ * row and an insert of the new one. `rows` is the table in the scan's order.
  */
 export interface InternalTableEvents<Row> {
   onInternalInsert(listener: (row: Row) => void): void;
   onInternalDelete(listener: (row: Row) => void): void;
+  rows(): Iterable<Row>;
 }
 
+/** A group's key: the value itself, or one value standing for it. */
+type Key = unknown;
+
 /**
- * Column types whose map key is the value itself (`AlgebraicType.intoMapKey`).
- * A `Map` finds such a key by `SameValueZero`, which is the scan's `===` for
- * every value but `NaN`.
+ * How one column type keys its rows. `keyOf` gives every value the scan's
+ * `deepEqual` calls equal the same key, and `undefined` for a lookup value the
+ * scan can match to no row. When `exact` says so for a lookup value, every
+ * row in its group equals it; otherwise each row is checked with `deepEqual`.
  */
+interface KeyRule {
+  keyOf(value: unknown): Key;
+  exact(value: unknown): boolean;
+}
+
+/** Types whose value is its own key: a `Map` finds it by `SameValueZero`, the scan's `===` but for NaN. */
 const SELF_KEYED = new Set<AlgebraicType['tag']>([
   'Bool',
   'String',
@@ -34,36 +53,105 @@ const SELF_KEYED = new Set<AlgebraicType['tag']>([
   'F64',
 ]);
 
+/**
+ * The one field of `Identity`, `ConnectionId`, `Timestamp`, `Uuid` and
+ * `TimeDuration` (`AlgebraicType.intoMapKey` keys them by it too). The
+ * deserializer makes each an instance with that field as its only own key.
+ */
+const SPECIAL_CLASSES = new Set<unknown>([
+  Identity,
+  ConnectionId,
+  Timestamp,
+  Uuid,
+  TimeDuration,
+]);
+const SPECIAL_FIELDS = new Set([
+  '__identity__',
+  '__connection_id__',
+  '__timestamp_micros_since_unix_epoch__',
+  '__uuid__',
+  '__time_duration_micros__',
+]);
+
+const selfKeyed: KeyRule = {
+  keyOf: value => (value !== value ? undefined : value),
+  exact: () => true,
+};
+
+function specialKeyed(field: string): KeyRule {
+  return {
+    keyOf: value =>
+      typeof value === 'object' && value !== null
+        ? (value as Record<string, unknown>)[field]
+        : undefined,
+    // A stored value's only own key is `field`, so a lookup equals every row
+    // in its group exactly when that is its only own key too.
+    exact: value => {
+      if (SPECIAL_CLASSES.has((value as object).constructor)) return true;
+      const keys = Object.keys(value as object);
+      return keys.length === 1 && keys[0] === field;
+    },
+  };
+}
+
+/** A plain enum (no variant has a payload) groups its rows by variant. */
+const enumKeyed: KeyRule = {
+  keyOf: value =>
+    typeof value === 'object' && value !== null
+      ? (value as { tag?: unknown }).tag
+      : undefined,
+  exact: () => false,
+};
+
+/**
+ * The rule for a column type, or `undefined` for one an index does not key:
+ * arrays, structs, options and sums with payloads keep the table scan. Their
+ * only map key would come from the serializer, which coerces what it is given
+ * (`{x: 1.9}` writes as `{x: 1}`, a string as the array of its characters)
+ * and tells `0` from `-0` where `deepEqual` does not, so a lookup could miss
+ * rows the scan finds. These are the column types the C# and Rust SDKs index,
+ * plus plain enums, which modules can index (spacetimedb_lib's
+ * `FilterableValue`).
+ */
+export function keyRuleFor(type: AlgebraicType): KeyRule | undefined {
+  if (SELF_KEYED.has(type.tag)) return selfKeyed;
+  if (type.tag === 'Product') {
+    const [only, ...rest] = type.value.elements;
+    if (only?.name && rest.length === 0 && SPECIAL_FIELDS.has(only.name)) {
+      return specialKeyed(only.name);
+    }
+    return undefined;
+  }
+  if (type.tag === 'Sum') {
+    const plain = type.value.variants.every(
+      variant =>
+        variant.algebraicType.tag === 'Product' &&
+        variant.algebraicType.value.elements.length === 0
+    );
+    return plain ? enumKeyed : undefined;
+  }
+  return undefined;
+}
+
 const NO_ROWS: readonly never[] = [];
 
 /**
  * An index on one column of a cached table, in the shape of the C# SDK's
  * `IndexBase` (`sdks/csharp/src/Table.cs`): the rows grouped by their value.
- *
- * A lookup answers exactly as the table scan it replaces, which compares the
- * column with `deepEqual`. Rows are grouped by `AlgebraicType.intoMapKey`,
- * which gives values the scan calls equal the same key (an `Identity` keys by
- * its number). The reverse does not hold for every type: the serializer
- * behind the other keys coerces what it is given (`{x: 1.9}` writes as
- * `{x: 1}`, a string iterates as an array of its characters), so for those a
- * group's rows are checked with `deepEqual` before they are returned.
+ * A lookup answers exactly as the table scan it replaces.
  */
 abstract class IndexBase<Row extends object> {
+  protected readonly table: InternalTableEvents<Row>;
   readonly #column: string;
-  readonly #keyType: AlgebraicType;
-  readonly #selfKeyed: boolean;
-  readonly #groups = new Map<ComparablePrimitive, Set<Row>>();
+  readonly #rule: KeyRule;
+  readonly #groups = new Map<Key, Set<Row>>();
 
-  constructor(
-    table: InternalTableEvents<Row>,
-    column: string,
-    keyType: AlgebraicType
-  ) {
+  constructor(table: InternalTableEvents<Row>, column: string, rule: KeyRule) {
+    this.table = table;
     this.#column = column;
-    this.#keyType = keyType;
-    this.#selfKeyed = SELF_KEYED.has(keyType.tag);
+    this.#rule = rule;
     table.onInternalInsert(row => {
-      const key = this.#keyOf(this.#valueOf(row));
+      const key = rule.keyOf(this.valueOf(row));
       let group = this.#groups.get(key);
       if (!group) {
         group = new Set();
@@ -75,7 +163,7 @@ abstract class IndexBase<Row extends object> {
     // even when another row has taken its value meanwhile: the table cache
     // applies a transaction's inserts before its deletes (C# deletes first).
     table.onInternalDelete(row => {
-      const key = this.#keyOf(this.#valueOf(row));
+      const key = rule.keyOf(this.valueOf(row));
       const group = this.#groups.get(key);
       if (!group) return;
       group.delete(row);
@@ -83,51 +171,44 @@ abstract class IndexBase<Row extends object> {
     });
   }
 
-  #valueOf(row: Row): unknown {
+  protected valueOf(row: Row): unknown {
     return (row as Record<string, unknown>)[this.#column];
   }
 
-  #keyOf(value: unknown): ComparablePrimitive {
-    return AlgebraicType.intoMapKey(this.#keyType, value);
-  }
-
-  /** The rows whose column the scan's `deepEqual` calls equal to `value`. */
-  protected rowsWith(value: unknown): Iterable<Row> {
-    if (this.#selfKeyed) {
-      // NaN is the one value a Map finds that `===` does not
-      if (value !== value) return NO_ROWS;
-      return this.#groups.get(value as ComparablePrimitive) ?? NO_ROWS;
+  /**
+   * The rows whose column the scan's `deepEqual` calls equal to `value`, or
+   * none. A value with no key matches nothing, as in the scan: so
+   * `identity.find(conn.identity)` before the connection has its identity.
+   */
+  protected rowsWith(value: unknown): ReadonlySet<Row> | readonly Row[] {
+    // the hot path (kino's lookups are nearly all on number keys), inlined
+    if (this.#rule === selfKeyed) {
+      return value !== value ? NO_ROWS : (this.#groups.get(value) ?? NO_ROWS);
     }
-    let key: ComparablePrimitive;
-    try {
-      key = this.#keyOf(value);
-    } catch {
-      // A value the serializer can't write (`identity.find(conn.identity)`
-      // before the connection has its identity passes `undefined`) matches
-      // nothing, as in the scan, instead of throwing. C#'s typed
-      // `Find(Column value)` can't be given one.
-      return NO_ROWS;
-    }
+    const key = this.#rule.keyOf(value);
+    if (key === undefined) return NO_ROWS;
     const group = this.#groups.get(key);
     if (!group) return NO_ROWS;
+    if (this.#rule.exact(value)) return group;
     const rows: Row[] = [];
     for (const row of group) {
-      if (deepEqual(this.#valueOf(row), value)) rows.push(row);
+      if (deepEqual(this.valueOf(row), value)) rows.push(row);
     }
     return rows;
   }
 }
 
-/**
- * A unique index: each value has at most one row once a transaction is
- * applied. C#'s `UniqueIndexBase`. It keeps a group per value as the BTree
- * index does: two rows hold one value while a transaction moves it, and on a
- * float column `0` and `-0` are two values but one Map key. Like the scan, it
- * returns the first row that matches.
- */
+/** A unique index: each value has at most one row. C#'s `UniqueIndexBase`. */
 export class UniqueIndex<Row extends object> extends IndexBase<Row> {
   find(value: unknown): Row | null {
-    for (const row of this.rowsWith(value)) return row;
+    const rows = this.rowsWith(value);
+    const count = 'size' in rows ? rows.size : rows.length;
+    if (count === 0) return null;
+    if (count === 1) return rows.values().next().value ?? null;
+    // Two rows hold one value while a transaction moves it, or on a float
+    // column holding 0 and -0: answer with the scan's first.
+    const holders = new Set<Row>(rows);
+    for (const row of this.table.rows()) if (holders.has(row)) return row;
     return null;
   }
 }
@@ -137,7 +218,7 @@ export class UniqueIndex<Row extends object> extends IndexBase<Row> {
  * also answers only one value at a time; a range still scans the table.
  */
 export class BTreeIndex<Row extends object> extends IndexBase<Row> {
-  filter(value: unknown): Iterable<Row> {
-    return this.rowsWith(value);
+  filter(value: unknown): IteratorObject<Row, undefined> {
+    return this.rowsWith(value).values() as IteratorObject<Row, undefined>;
   }
 }

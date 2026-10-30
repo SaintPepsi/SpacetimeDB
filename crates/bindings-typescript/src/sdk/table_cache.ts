@@ -4,6 +4,7 @@ import { stdbLogger } from './logger.ts';
 import { deepEqual, type ComparablePrimitive } from '../';
 import {
   BTreeIndex,
+  keyRuleFor,
   UniqueIndex,
   type InternalTableEvents,
 } from './client_index.ts';
@@ -93,6 +94,7 @@ export class TableCacheImpl<
   #internalEvents: InternalTableEvents<CachedRow> = {
     onInternalInsert: listener => this.#internalInsertListeners.push(listener),
     onInternalDelete: listener => this.#internalDeleteListeners.push(listener),
+    rows: () => this.iter(),
   };
 
   /**
@@ -215,29 +217,32 @@ export class TableCacheImpl<
 
     // eslint-disable-next-line @typescript-eslint/no-this-alias
     const self = this;
-    // A one-column index keeps its rows by value, as the C# SDK's do.
-    // Multi-column indexes still scan.
+    // A one-column index keeps its rows by value, as the C# SDK's do, on the
+    // column types `keyRuleFor` keys. Multi-column indexes and the other
+    // column types still scan.
     const column = columns.length === 1 ? columns[0] : undefined;
     const keyType =
       column === undefined
         ? undefined
         : tableDef.columns[column]?.typeBuilder.algebraicType;
+    const rule = keyType === undefined ? undefined : keyRuleFor(keyType);
     if (isUnique) {
       const index =
-        column === undefined || keyType === undefined
+        column === undefined || rule === undefined
           ? undefined
-          : new UniqueIndex(this.#internalEvents, column, keyType);
+          : new UniqueIndex(this.#internalEvents, column, rule);
       const impl: ReadonlyUniqueIndex<TableDef, I> = {
         find: (colVal: any): Row | null => {
-          // For unique btree, caller supplies the *full* key (tuple if multi-col).
-          const expected = Array.isArray(colVal) ? colVal : [colVal];
           if (index) {
-            // The key is one value, so the scan below matches nothing else;
-            // as there, an array column's value comes wrapped as `[value]`.
-            return expected.length === 1
-              ? (index.find(expected[0]) as Row | null)
+            // The key is one value, so the scan below matches nothing else:
+            // a bare value, or one wrapped as `[value]`.
+            if (!Array.isArray(colVal)) return index.find(colVal) as Row | null;
+            return colVal.length === 1
+              ? (index.find(colVal[0]) as Row | null)
               : null;
           }
+          // For unique btree, caller supplies the *full* key (tuple if multi-col).
+          const expected = Array.isArray(colVal) ? colVal : [colVal];
           for (const row of self.iter()) {
             if (deepEqual(getKey(row), expected)) return row;
           }
@@ -247,18 +252,20 @@ export class TableCacheImpl<
       return impl as ReadonlyIndex<TableDef, I>;
     } else {
       const index =
-        column === undefined || keyType === undefined
+        column === undefined || rule === undefined
           ? undefined
-          : new BTreeIndex(this.#internalEvents, column, keyType);
+          : new BTreeIndex(this.#internalEvents, column, rule);
+      function* scan(range: any): IteratorObject<Row, undefined> {
+        for (const row of self.iter()) {
+          if (matchRange(row, range)) yield row;
+        }
+      }
       const impl: ReadonlyRangedIndex<TableDef, I> = {
-        *filter(range: any): IteratorObject<Row, undefined> {
+        filter(range: any): IteratorObject<Row, undefined> {
           if (index && !Array.isArray(range) && !isRange(range)) {
-            yield* index.filter(range) as Iterable<Row>;
-            return;
+            return index.filter(range) as IteratorObject<Row, undefined>;
           }
-          for (const row of self.iter()) {
-            if (matchRange(row, range)) yield row;
-          }
+          return scan(range);
         },
       };
       return impl as ReadonlyIndex<TableDef, I>;

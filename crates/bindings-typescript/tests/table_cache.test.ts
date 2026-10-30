@@ -1200,9 +1200,9 @@ describe('TableCache', () => {
     const scanFilter = (cache: any, value: unknown) =>
       [...cache.iter()].filter((row: any) => deepEqual(row.shared, value));
 
-    // Columns a module can index through `indexes:` whose map keys come from
-    // the serializer, which coerces what it is given; and floats, where a Map
-    // and `===` disagree on NaN.
+    // Columns a module can index through `indexes:` whose only map key would
+    // come from the serializer, which coerces what it is given (these keep the
+    // scan); and floats, where a Map and `===` disagree on NaN.
     const Point = t.object('Point', { x: t.u32() });
     const hazards: {
       name: string;
@@ -1220,7 +1220,7 @@ describe('TableCache', () => {
         name: 'an array of u32',
         type: () => t.array(t.u32()),
         values: [[1, 2], [0]],
-        lookups: [[[1, 2]], [[0]], [1, 2], [0], [[1.5, 2]]],
+        lookups: [[[1, 2]], [[0]], [1, 2], [0], [[1.5, 2]], [{ 0: 1, 1: 2 }]],
       },
       {
         name: 'a struct',
@@ -1274,6 +1274,59 @@ describe('TableCache', () => {
         }
       });
     }
+
+    test("a unique float column holding 0 and -0 answers with the scan's first row, after an update too", () => {
+      const cache = indexedOn(t.f64());
+      const zero = { id: 1, unique: 0, shared: 0 };
+      const minusZero = { id: 2, unique: -0, shared: -0 };
+      cache.applyOperations(
+        [zero, minusZero].map(row => ({ type: 'insert', rowId: row.id, row })),
+        {} as any
+      );
+      const iter = vi.spyOn(cache, 'iter');
+      expect(cache.unique.find(0)).toBe(zero);
+      expect(cache.unique.find(-0)).toBe(zero);
+      const updated = { id: 1, unique: 0, shared: 1 };
+      cache.applyOperations(
+        [
+          { type: 'delete', rowId: 1, row: zero },
+          { type: 'insert', rowId: 1, row: updated },
+        ],
+        {} as any
+      );
+      // the update keeps row 1's place in the table, so the scan still finds it first
+      expect(cache.unique.find(0)).toBe(scanFind(cache, 0));
+      expect(cache.unique.find(0)).toBe(updated);
+      cache.applyOperations(
+        [{ type: 'delete', rowId: 2, row: minusZero }],
+        {} as any
+      );
+      expect(cache.unique.find(-0)).toBe(updated);
+      expect(iter).toHaveBeenCalled(); // two rows to one key: the scan picks
+    });
+
+    test('a lookup equal to an Identity but not one matches as the scan does', () => {
+      const cache = indexedOn(t.identity());
+      const owner = Identity.fromString('ab'.repeat(32));
+      const row = { id: 1, unique: owner, shared: owner };
+      cache.applyOperations([{ type: 'insert', rowId: 1, row }], {} as any);
+      const plain = { __identity__: owner.__identity__ };
+      const extra = { __identity__: owner.__identity__, more: 1 };
+      for (const lookup of [
+        plain,
+        extra,
+        owner.__identity__,
+        null,
+        undefined,
+      ]) {
+        expect(cache.unique.find(lookup)).toBe(scanFind(cache, lookup));
+        expect([...cache.shared.filter(lookup)]).toEqual(
+          scanFilter(cache, lookup)
+        );
+      }
+      expect(cache.unique.find(plain)).toBe(row);
+      expect(cache.unique.find(extra)).toBeNull();
+    });
 
     test('an index on a table without a primary key', () => {
       const { tally } = schema({
