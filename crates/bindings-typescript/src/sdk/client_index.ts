@@ -2,12 +2,14 @@ import { deepEqual, type AlgebraicType } from '../';
 
 /**
  * What an index reads of the cached table. The table cache calls the
- * listeners after it changes its own rows; an update is a delete of the old
- * row and an insert of the new one. `rows` is the table in the scan's order.
+ * listeners after it changes its own rows: a replace is a row's object
+ * changing under one row id (an update, or a copy another subscription
+ * delivers). `rows` is the table in the scan's order.
  */
 export interface InternalTableEvents<Row> {
   onInternalInsert(listener: (row: Row) => void): void;
   onInternalDelete(listener: (row: Row) => void): void;
+  onInternalReplace(listener: (oldRow: Row, newRow: Row) => void): void;
   rows(): Iterable<Row>;
 }
 
@@ -140,30 +142,55 @@ abstract class IndexBase<Row extends object> {
   readonly #column: string;
   readonly #rule: KeyRule;
   readonly #groups = new Map<Key, Set<Row>>();
+  // Each row's key as it was filed, so a row leaves the group it is in even
+  // if app code has since changed its column, as the scan would follow.
+  readonly #keys = new Map<Row, Key>();
 
   constructor(table: InternalTableEvents<Row>, column: string, rule: KeyRule) {
     this.table = table;
     this.#column = column;
     this.#rule = rule;
-    table.onInternalInsert(row => {
-      const key = rule.keyOf(this.valueOf(row));
-      let group = this.#groups.get(key);
-      if (!group) {
-        group = new Set();
-        this.#groups.set(key, group);
-      }
-      group.add(row);
-    });
+    table.onInternalInsert(row => this.#add(row));
     // The delete names the row object the cache held, so it leaves its group
     // even when another row has taken its value meanwhile: the table cache
     // applies a transaction's inserts before its deletes (C# deletes first).
-    table.onInternalDelete(row => {
-      const key = rule.keyOf(this.valueOf(row));
-      const group = this.#groups.get(key);
-      if (!group) return;
-      group.delete(row);
-      if (group.size === 0) this.#groups.delete(key);
+    table.onInternalDelete(row => this.#remove(row));
+    table.onInternalReplace((oldRow, newRow) => {
+      const oldKey = this.#keys.get(oldRow);
+      const newKey = rule.keyOf(this.valueOf(newRow));
+      const group = this.#groups.get(oldKey);
+      // An update that leaves the column as it was swaps the object in its
+      // group, with no group made or dropped.
+      if (group && Object.is(oldKey, newKey) && group.delete(oldRow)) {
+        this.#keys.delete(oldRow);
+        this.#keys.set(newRow, newKey);
+        group.add(newRow);
+        return;
+      }
+      this.#remove(oldRow);
+      this.#add(newRow);
     });
+  }
+
+  #add(row: Row): void {
+    const key = this.#rule.keyOf(this.valueOf(row));
+    this.#keys.set(row, key);
+    let group = this.#groups.get(key);
+    if (!group) {
+      group = new Set();
+      this.#groups.set(key, group);
+    }
+    group.add(row);
+  }
+
+  #remove(row: Row): void {
+    if (!this.#keys.has(row)) return;
+    const key = this.#keys.get(row);
+    this.#keys.delete(row);
+    const group = this.#groups.get(key);
+    if (!group) return;
+    group.delete(row);
+    if (group.size === 0) this.#groups.delete(key);
   }
 
   protected valueOf(row: Row): unknown {

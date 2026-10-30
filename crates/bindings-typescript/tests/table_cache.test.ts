@@ -865,6 +865,17 @@ describe('TableCache', () => {
       expect(cache.id.find(1)).toBeNull();
     });
 
+    test('a row app code changed still leaves its index when the server deletes it', () => {
+      const cache = cacheOf([mk(1, 7), mk(2, 7)]);
+      const row = cache.id.find(1);
+      row.player = 8; // rows are plain objects, so app code can do this
+      cache.applyOperations([op('delete', mk(1, 7))], {} as any);
+      expect(cache.count()).toBe(1n);
+      expect(ids(cache.player.filter(7))).toEqual([2]);
+      expect(ids(cache.player.filter(8))).toEqual([]);
+      expect(cache.id.find(1)).toBeNull();
+    });
+
     test('a unique value moving to another row in one transaction is found on the new row', () => {
       const cache = cacheOf([mk(1, 7)]);
       const renamed = { ...mk(2, 7), name: 'score 1' };

@@ -91,9 +91,15 @@ export class TableCacheImpl<
   // before any user callback.
   #internalInsertListeners: ((row: CachedRow) => void)[] = [];
   #internalDeleteListeners: ((row: CachedRow) => void)[] = [];
+  #internalReplaceListeners: ((
+    oldRow: CachedRow,
+    newRow: CachedRow
+  ) => void)[] = [];
   #internalEvents: InternalTableEvents<CachedRow> = {
     onInternalInsert: listener => this.#internalInsertListeners.push(listener),
     onInternalDelete: listener => this.#internalDeleteListeners.push(listener),
+    onInternalReplace: listener =>
+      this.#internalReplaceListeners.push(listener),
     rows: () => this.iter(),
   };
 
@@ -279,6 +285,13 @@ export class TableCacheImpl<
 
   #internalDelete(row: CachedRow): void {
     for (const listener of this.#internalDeleteListeners) listener(row);
+  }
+
+  #internalReplace(oldRow: CachedRow, newRow: CachedRow): void {
+    if (oldRow === newRow) return;
+    for (const listener of this.#internalReplaceListeners) {
+      listener(oldRow, newRow);
+    }
   }
 
   /**
@@ -467,8 +480,7 @@ export class TableCacheImpl<
       return undefined;
     }
     this.rows.set(rowId, [newRow, refCount]);
-    this.#internalDelete(oldRow);
-    this.#internalInsert(newRow);
+    this.#internalReplace(oldRow, newRow);
     if (skipIfIdentical && deepEqual(oldRow, newRow)) {
       // The row is unchanged; the reference count was adjusted above but no
       // callback fires.
@@ -512,8 +524,7 @@ export class TableCacheImpl<
     if (previousCount > 0) {
       // The cache now holds the new copy of a row another subscription
       // already had, so the indexes must too.
-      this.#internalDelete(cachedRow);
-      this.#internalInsert(operation.row);
+      this.#internalReplace(cachedRow, operation.row);
     }
     if (previousCount === 0) {
       this.#internalInsert(operation.row);
@@ -560,8 +571,7 @@ export class TableCacheImpl<
     }
     this.rows.set(operation.rowId, [operation.row, previousCount - count]);
     // as on insert: the indexes follow the copy the cache now holds
-    this.#internalDelete(cachedRow);
-    this.#internalInsert(operation.row);
+    this.#internalReplace(cachedRow, operation.row);
     return undefined;
   };
 

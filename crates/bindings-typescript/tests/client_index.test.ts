@@ -12,6 +12,7 @@ function fakeTable<Row>() {
   return {
     onInternalInsert: (listener: (row: Row) => void) => inserts.push(listener),
     onInternalDelete: (listener: (row: Row) => void) => deletes.push(listener),
+    onInternalReplace: () => {},
     rows: () => rows,
     insert: (row: Row) => {
       rows.add(row);
