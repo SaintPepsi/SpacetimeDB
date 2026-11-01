@@ -243,6 +243,13 @@ export const AlgebraicType = {
       }
     }
   },
+  /**
+   * Whether the type is a primitive: one with a serializer of its own, whose
+   * values `intoMapKey` uses as their own keys.
+   */
+  isPrimitive(ty: AlgebraicTypeType): boolean {
+    return hasOwn(primitiveSerializers, ty.tag);
+  },
 };
 
 function bindCall<F extends (this: any, ...args: any[]) => any>(
@@ -600,6 +607,20 @@ return result;`
     AlgebraicType.serializeValue(writer, AlgebraicType.Product(ty), value);
     return writer.toBase64();
   },
+  /**
+   * The one field of a special product type (`Identity`, `ConnectionId`,
+   * `Timestamp`, `TimeDuration`, `Uuid`), which the deserializer makes an
+   * instance of its class and `intoMapKey` keys the value by; `undefined` for
+   * any other product type.
+   */
+  specialField(ty: ProductTypeType): string | undefined {
+    if (ty.elements.length !== 1) return undefined;
+    const fieldName = ty.elements[0].name;
+    return fieldName !== undefined &&
+      hasOwn(specialProductDeserializers, fieldName)
+      ? fieldName
+      : undefined;
+  },
 };
 
 export type SumType = SumTypeType;
@@ -630,11 +651,7 @@ export type SumType = SumTypeType;
  */
 export const SumType = {
   makeSerializer(ty: SumTypeType, typespace?: TypespaceType): Serializer<any> {
-    if (
-      ty.variants.length == 2 &&
-      ty.variants[0].name === 'some' &&
-      ty.variants[1].name === 'none'
-    ) {
+    if (SumType.isOption(ty)) {
       const serialize = AlgebraicType.makeSerializer(
         ty.variants[0].algebraicType,
         typespace
@@ -647,11 +664,7 @@ export const SumType = {
           writer.writeByte(1);
         }
       };
-    } else if (
-      ty.variants.length == 2 &&
-      ty.variants[0].name === 'ok' &&
-      ty.variants[1].name === 'err'
-    ) {
+    } else if (SumType.isResult(ty)) {
       const serializeOk = AlgebraicType.makeSerializer(
         ty.variants[0].algebraicType,
         typespace
@@ -737,11 +750,7 @@ ${ty.variants
     // most benefit in cases where the object has a different shape. Since
     // option/result always have the same number of variants, there's not as
     // much benefit for the amount of work.
-    if (
-      ty.variants.length == 2 &&
-      ty.variants[0].name === 'some' &&
-      ty.variants[1].name === 'none'
-    ) {
+    if (SumType.isOption(ty)) {
       const deserialize = AlgebraicType.makeDeserializer(
         ty.variants[0].algebraicType,
         typespace
@@ -756,11 +765,7 @@ ${ty.variants
           throw `Can't deserialize an option type, couldn't find ${tag} tag`;
         }
       };
-    } else if (
-      ty.variants.length == 2 &&
-      ty.variants[0].name === 'ok' &&
-      ty.variants[1].name === 'err'
-    ) {
+    } else if (SumType.isResult(ty)) {
       const deserializeOk = AlgebraicType.makeDeserializer(
         ty.variants[0].algebraicType,
         typespace
@@ -813,6 +818,22 @@ ${ty.variants
     typespace?: TypespaceType
   ): any {
     return SumType.makeDeserializer(ty, typespace)(reader);
+  },
+  /** Whether the type is an option: variants `some` and `none`, read as the value or `undefined`. */
+  isOption(ty: SumTypeType): boolean {
+    return (
+      ty.variants.length == 2 &&
+      ty.variants[0].name === 'some' &&
+      ty.variants[1].name === 'none'
+    );
+  },
+  /** Whether the type is a result: variants `ok` and `err`, read as `{ ok }` or `{ err }`. */
+  isResult(ty: SumTypeType): boolean {
+    return (
+      ty.variants.length == 2 &&
+      ty.variants[0].name === 'ok' &&
+      ty.variants[1].name === 'err'
+    );
   },
 };
 
