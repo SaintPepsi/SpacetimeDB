@@ -1,10 +1,5 @@
-import { deepEqual, type AlgebraicType } from '../';
-import {
-  isOptionType,
-  isPrimitiveTag,
-  isResultType,
-  isSpecialProductField,
-} from '../lib/algebraic_type';
+import { deepEqual } from '../';
+import { AlgebraicType, ProductType, SumType } from '../lib/algebraic_type';
 
 /**
  * What an index reads of the cached table. The table cache calls the
@@ -80,18 +75,17 @@ const enumKeyed: KeyRule = {
  * `FilterableValue`).
  */
 export function keyRuleFor(type: AlgebraicType): KeyRule | undefined {
-  if (isPrimitiveTag(type.tag)) return selfKeyed;
+  if (AlgebraicType.isPrimitive(type)) return selfKeyed;
   if (type.tag === 'Product') {
-    const [only, ...rest] = type.value.elements;
-    if (only?.name && rest.length === 0 && isSpecialProductField(only.name)) {
-      return specialKeyed(only.name);
-    }
-    return undefined;
+    const field = ProductType.specialField(type.value);
+    return field === undefined ? undefined : specialKeyed(field);
   }
   if (type.tag === 'Sum') {
     // The deserializer gives an option and a result shapes of their own, with
     // no `tag`.
-    if (isOptionType(type.value) || isResultType(type.value)) return undefined;
+    if (SumType.isOption(type.value) || SumType.isResult(type.value)) {
+      return undefined;
+    }
     const plain = type.value.variants.every(
       variant =>
         variant.algebraicType.tag === 'Product' &&

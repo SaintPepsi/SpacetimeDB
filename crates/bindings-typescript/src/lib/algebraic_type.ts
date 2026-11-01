@@ -243,6 +243,13 @@ export const AlgebraicType = {
       }
     }
   },
+  /**
+   * Whether the type is a primitive: one with a serializer of its own, whose
+   * values `intoMapKey` uses as their own keys.
+   */
+  isPrimitive(ty: AlgebraicTypeType): boolean {
+    return hasOwn(primitiveSerializers, ty.tag);
+  },
 };
 
 function bindCall<F extends (this: any, ...args: any[]) => any>(
@@ -275,14 +282,6 @@ const primitiveSerializers: Record<Primitives, Serializer<any>> = {
   String: bindCall(BinaryWriter.prototype.writeString),
 };
 Object.freeze(primitiveSerializers);
-
-/**
- * Whether `tag` names a primitive type: one read and written by its own
- * serializer, and its own map key in `AlgebraicType.intoMapKey`.
- */
-export function isPrimitiveTag(tag: AlgebraicType['tag']): tag is Primitives {
-  return hasOwn(primitiveSerializers, tag);
-}
 
 const serializeUint8Array = bindCall(BinaryWriter.prototype.writeUInt8Array);
 
@@ -383,18 +382,6 @@ const specialProductDeserializers: {
   __uuid__: reader => new Uuid(reader.readU128()),
 };
 Object.freeze(specialProductDeserializers);
-
-/**
- * Whether `name` is the one field of a special product type (`Identity`,
- * `ConnectionId`, `Timestamp`, `TimeDuration`, `Uuid`), which the
- * deserializer makes an instance of its class and `ProductType.intoMapKey`
- * keys by that field.
- */
-export function isSpecialProductField(
-  name: string
-): name is keyof SpecialProducts {
-  return hasOwn(specialProductDeserializers, name);
-}
 
 const unitDeserializer: Deserializer<{}> = () => ({});
 
@@ -620,6 +607,20 @@ return result;`
     AlgebraicType.serializeValue(writer, AlgebraicType.Product(ty), value);
     return writer.toBase64();
   },
+  /**
+   * The one field of a special product type (`Identity`, `ConnectionId`,
+   * `Timestamp`, `TimeDuration`, `Uuid`), which the deserializer makes an
+   * instance of its class and `intoMapKey` keys the value by; `undefined` for
+   * any other product type.
+   */
+  specialField(ty: ProductTypeType): string | undefined {
+    if (ty.elements.length !== 1) return undefined;
+    const fieldName = ty.elements[0].name;
+    return fieldName !== undefined &&
+      hasOwn(specialProductDeserializers, fieldName)
+      ? fieldName
+      : undefined;
+  },
 };
 
 export type SumType = SumTypeType;
@@ -648,27 +649,9 @@ export type SumType = SumTypeType;
  *
  * [structural]: https://en.wikipedia.org/wiki/Structural_type_system
  */
-/** Whether `ty` is an option: variants `some` and `none`, read as the value or `undefined`. */
-export function isOptionType(ty: SumTypeType): boolean {
-  return (
-    ty.variants.length == 2 &&
-    ty.variants[0].name === 'some' &&
-    ty.variants[1].name === 'none'
-  );
-}
-
-/** Whether `ty` is a result: variants `ok` and `err`, read as `{ ok }` or `{ err }`. */
-export function isResultType(ty: SumTypeType): boolean {
-  return (
-    ty.variants.length == 2 &&
-    ty.variants[0].name === 'ok' &&
-    ty.variants[1].name === 'err'
-  );
-}
-
 export const SumType = {
   makeSerializer(ty: SumTypeType, typespace?: TypespaceType): Serializer<any> {
-    if (isOptionType(ty)) {
+    if (SumType.isOption(ty)) {
       const serialize = AlgebraicType.makeSerializer(
         ty.variants[0].algebraicType,
         typespace
@@ -681,7 +664,7 @@ export const SumType = {
           writer.writeByte(1);
         }
       };
-    } else if (isResultType(ty)) {
+    } else if (SumType.isResult(ty)) {
       const serializeOk = AlgebraicType.makeSerializer(
         ty.variants[0].algebraicType,
         typespace
@@ -767,7 +750,7 @@ ${ty.variants
     // most benefit in cases where the object has a different shape. Since
     // option/result always have the same number of variants, there's not as
     // much benefit for the amount of work.
-    if (isOptionType(ty)) {
+    if (SumType.isOption(ty)) {
       const deserialize = AlgebraicType.makeDeserializer(
         ty.variants[0].algebraicType,
         typespace
@@ -782,7 +765,7 @@ ${ty.variants
           throw `Can't deserialize an option type, couldn't find ${tag} tag`;
         }
       };
-    } else if (isResultType(ty)) {
+    } else if (SumType.isResult(ty)) {
       const deserializeOk = AlgebraicType.makeDeserializer(
         ty.variants[0].algebraicType,
         typespace
@@ -835,6 +818,22 @@ ${ty.variants
     typespace?: TypespaceType
   ): any {
     return SumType.makeDeserializer(ty, typespace)(reader);
+  },
+  /** Whether the type is an option: variants `some` and `none`, read as the value or `undefined`. */
+  isOption(ty: SumTypeType): boolean {
+    return (
+      ty.variants.length == 2 &&
+      ty.variants[0].name === 'some' &&
+      ty.variants[1].name === 'none'
+    );
+  },
+  /** Whether the type is a result: variants `ok` and `err`, read as `{ ok }` or `{ err }`. */
+  isResult(ty: SumTypeType): boolean {
+    return (
+      ty.variants.length == 2 &&
+      ty.variants[0].name === 'ok' &&
+      ty.variants[1].name === 'err'
+    );
   },
 };
 
