@@ -1,5 +1,17 @@
-import { describe, expect, test } from 'vitest';
-import { AlgebraicType, Identity, type Infer } from '../src';
+import { describe, expect, test, vi } from 'vitest';
+import {
+  AlgebraicType,
+  ConnectionId,
+  deepEqual,
+  Identity,
+  schema,
+  t,
+  table,
+  TimeDuration,
+  Timestamp,
+  Uuid,
+  type Infer,
+} from '../src';
 import { type Operation, TableCacheImpl } from '../src/sdk/table_cache';
 import { tables } from '../test-app/src/module_bindings/index.ts';
 import { Player } from '../test-app/src/module_bindings/types';
@@ -752,6 +764,722 @@ describe('TableCache', () => {
         cb.cb();
       });
       expect(rowsInserted).toEqual(1);
+    });
+  });
+
+  describe('index lookups', () => {
+    // A score per row: `id` the primary key, `player` an index (not unique),
+    // `name` a unique column that is not the primary key.
+    const { score } = schema({
+      score: table(
+        {
+          name: 'score',
+          indexes: [
+            {
+              accessor: 'player',
+              name: 'score_player_idx_btree',
+              algorithm: 'btree',
+              columns: ['player'],
+            },
+            {
+              accessor: 'name',
+              name: 'score_name_idx_btree',
+              algorithm: 'btree',
+              columns: ['name'],
+            },
+          ],
+          constraints: [
+            { name: 'score_name_key', constraint: 'unique', columns: ['name'] },
+          ],
+        },
+        t.row({
+          id: t.u32().primaryKey(),
+          player: t.u32(),
+          name: t.string(),
+          points: t.u32(),
+        })
+      ),
+    }).schemaType.tables;
+    type Score = { id: number; player: number; name: string; points: number };
+    const mk = (id: number, player: number, points = 0): Score => ({
+      id,
+      player,
+      name: `score ${id}`,
+      points,
+    });
+    const op = (type: 'insert' | 'delete', row: Score) => ({
+      type,
+      rowId: row.id,
+      row,
+    });
+    const cacheOf = (rows: Score[]) => {
+      const cache: any = new TableCacheImpl(score as any);
+      cache.applyOperations(
+        rows.map(r => op('insert', r)),
+        {} as any
+      );
+      return cache;
+    };
+    const ids = (rows: Iterable<Score>) => [...rows].map(r => r.id).sort();
+
+    test('find on the primary key does not scan the table', () => {
+      const cache = cacheOf([mk(1, 7), mk(2, 7), mk(3, 8)]);
+      const iter = vi.spyOn(cache, 'iter');
+      expect(cache.id.find(2)).toEqual(mk(2, 7));
+      expect(cache.id.find(4)).toBeNull();
+      expect(iter).not.toHaveBeenCalled();
+    });
+
+    test('find on a unique column that is not the primary key does not scan', () => {
+      const cache = cacheOf([mk(1, 7), mk(2, 7)]);
+      const iter = vi.spyOn(cache, 'iter');
+      expect(cache.name.find('score 2')).toEqual(mk(2, 7));
+      expect(cache.name.find('score 3')).toBeNull();
+      expect(iter).not.toHaveBeenCalled();
+    });
+
+    test('filter on one value does not scan the table', () => {
+      const cache = cacheOf([mk(1, 7), mk(2, 7), mk(3, 8)]);
+      const iter = vi.spyOn(cache, 'iter');
+      expect(ids(cache.player.filter(7))).toEqual([1, 2]);
+      expect(ids(cache.player.filter(9))).toEqual([]);
+      expect(iter).not.toHaveBeenCalled();
+    });
+
+    test('a row a second subscription also holds: the indexes hold the copy the cache holds', () => {
+      const cache = cacheOf([mk(1, 7), mk(2, 7)]);
+      const second = mk(1, 7);
+      cache.applyOperations([op('insert', second)], {} as any); // a second subscription
+      // the cache keeps the copy that came last, as the stock cache does
+      expect(cache.id.find(1)).toBe(second);
+      expect(cache.id.find(1)).toBe([...cache.iter()][0]);
+      const released = mk(1, 7);
+      cache.applyOperations([op('delete', released)], {} as any); // one lets go
+      expect(cache.id.find(1)).toBe(released);
+      expect(cache.name.find('score 1')).toBe(released);
+      expect(
+        [...cache.player.filter(7)].map((r: Score) => r.id).sort()
+      ).toEqual([1, 2]);
+      cache.applyOperations([op('delete', mk(1, 7))], {} as any); // the other lets go
+      expect(ids(cache.player.filter(7))).toEqual([2]);
+      expect(cache.id.find(1)).toBeNull();
+    });
+
+    test('a row app code changed still leaves its index when the server deletes it', () => {
+      const cache = cacheOf([mk(1, 7), mk(2, 7)]);
+      const row = cache.id.find(1);
+      row.player = 8; // rows are plain objects, so app code can do this
+      cache.applyOperations([op('delete', mk(1, 7))], {} as any);
+      expect(cache.count()).toBe(1n);
+      expect(ids(cache.player.filter(7))).toEqual([2]);
+      expect(ids(cache.player.filter(8))).toEqual([]);
+      expect(cache.id.find(1)).toBeNull();
+    });
+
+    test('a unique value moving to another row in one transaction is found on the new row', () => {
+      const cache = cacheOf([mk(1, 7)]);
+      const renamed = { ...mk(2, 7), name: 'score 1' };
+      // inserts are applied before deletes
+      cache.applyOperations(
+        [op('delete', mk(1, 7)), op('insert', renamed)],
+        {} as any
+      );
+      expect(cache.name.find('score 1')).toEqual(renamed);
+    });
+
+    test('a key wrapped as a one-element tuple answers as before', () => {
+      const cache = cacheOf([mk(1, 7), mk(2, 8)]);
+      expect(cache.id.find([2])).toEqual(mk(2, 8));
+      expect(cache.name.find(['score 1'])).toEqual(mk(1, 7));
+      expect(cache.id.find([1, 2])).toBeNull();
+      expect(ids(cache.player.filter([7]))).toEqual([1]);
+      // the scan's `deepEqual` counts the tuple's other own keys
+      expect(cache.id.find(Object.assign([2], { more: 1 }))).toBeNull();
+    });
+
+    // Every column type the Rust SDK's unique_test_table.rs covers, and the
+    // TS builders that are `Indexable`. A lookup takes a value equal to the
+    // stored one, not the same object.
+    const Color = t.enum('Color', ['red', 'green']);
+    const keyTypes: {
+      name: string;
+      column: () => any;
+      a: () => unknown;
+      b: () => unknown;
+    }[] = [
+      { name: 'u8', column: () => t.u8(), a: () => 1, b: () => 255 },
+      { name: 'u16', column: () => t.u16(), a: () => 0, b: () => 65535 },
+      { name: 'i8', column: () => t.i8(), a: () => -128, b: () => 127 },
+      { name: 'i16', column: () => t.i16(), a: () => -1, b: () => 1 },
+      { name: 'i32', column: () => t.i32(), a: () => -5, b: () => 5 },
+      {
+        name: 'u64',
+        column: () => t.u64(),
+        a: () => 1n,
+        b: () => 2n ** 64n - 1n,
+      },
+      { name: 'i64', column: () => t.i64(), a: () => -1n, b: () => 1n },
+      {
+        name: 'u128',
+        column: () => t.u128(),
+        a: () => 1n,
+        b: () => 2n ** 128n - 1n,
+      },
+      {
+        name: 'i128',
+        column: () => t.i128(),
+        a: () => -(2n ** 127n),
+        b: () => 0n,
+      },
+      {
+        name: 'u256',
+        column: () => t.u256(),
+        a: () => 0n,
+        b: () => 2n ** 256n - 1n,
+      },
+      {
+        name: 'i256',
+        column: () => t.i256(),
+        a: () => -1n,
+        b: () => 2n ** 255n - 1n,
+      },
+      { name: 'bool', column: () => t.bool(), a: () => false, b: () => true },
+      {
+        name: 'string',
+        column: () => t.string(),
+        a: () => '',
+        b: () => 'é 🦀',
+      },
+      {
+        name: 'Identity',
+        column: () => t.identity(),
+        a: () => new Identity(1n),
+        b: () => new Identity(2n ** 256n - 1n),
+      },
+      {
+        name: 'ConnectionId',
+        column: () => t.connectionId(),
+        a: () => new ConnectionId(1n),
+        b: () => new ConnectionId(2n ** 128n - 1n),
+      },
+      {
+        name: 'Uuid',
+        column: () => t.uuid(),
+        a: () => new Uuid(1n),
+        b: () => new Uuid(2n ** 128n - 1n),
+      },
+      {
+        name: 'Timestamp',
+        column: () => t.timestamp(),
+        a: () => new Timestamp(-1n),
+        b: () => new Timestamp(1_700_000_000_000_000n),
+      },
+      {
+        name: 'TimeDuration',
+        column: () => t.timeDuration(),
+        a: () => new TimeDuration(0n),
+        b: () => new TimeDuration(-60_000_000n),
+      },
+      {
+        name: 'plain enum',
+        column: () => Color,
+        // the shape the sum deserializer gives a unit variant
+        a: () => ({ tag: 'red', value: {} }),
+        b: () => ({ tag: 'green', value: {} }),
+      },
+    ];
+    for (const { name, column, a, b } of keyTypes) {
+      test(`find and filter on a ${name} column read the index`, () => {
+        const { keyed } = schema({
+          keyed: table(
+            {
+              name: 'keyed',
+              indexes: [
+                {
+                  accessor: 'unique',
+                  name: 'keyed_unique_idx_btree',
+                  algorithm: 'btree',
+                  columns: ['unique'],
+                },
+                {
+                  accessor: 'shared',
+                  name: 'keyed_shared_idx_btree',
+                  algorithm: 'btree',
+                  columns: ['shared'],
+                },
+              ],
+              constraints: [
+                {
+                  name: 'keyed_unique_key',
+                  constraint: 'unique',
+                  columns: ['unique'],
+                },
+              ],
+            },
+            t.row({
+              id: t.u32().primaryKey(),
+              unique: column(),
+              shared: column(),
+            })
+          ),
+        }).schemaType.tables;
+        const cache: any = new TableCacheImpl(keyed as any);
+        // two rows, as a bool has only two values
+        const rows = [
+          { id: 1, unique: a(), shared: a() },
+          { id: 2, unique: b(), shared: a() },
+        ];
+        cache.applyOperations(
+          rows.map(row => ({ type: 'insert', rowId: row.id, row })),
+          {} as any
+        );
+        const iter = vi.spyOn(cache, 'iter');
+        expect(cache.unique.find(a())).toBe(rows[0]);
+        expect(cache.unique.find(b())).toBe(rows[1]);
+        expect(ids(cache.shared.filter(a()))).toEqual([1, 2]);
+        expect(ids(cache.shared.filter(b()))).toEqual([]);
+        expect(iter).not.toHaveBeenCalled();
+
+        cache.applyOperations(
+          [
+            {
+              type: 'delete',
+              rowId: 1,
+              row: { id: 1, unique: a(), shared: a() },
+            },
+          ],
+          {} as any
+        );
+        expect(cache.unique.find(a())).toBeNull();
+        expect(cache.unique.find(b())).toBe(rows[1]);
+        expect(ids(cache.shared.filter(a()))).toEqual([2]);
+      });
+    }
+
+    test('a row reconnect finds unchanged keeps the index in step with the cache', () => {
+      // Reconnecting replays the subscription as a delete of every cached row
+      // and an insert of each row the server still has; an unchanged row is an
+      // update that fires no callback, but the cache now holds the new object
+      // and the indexes must too, or a later delete leaves the old one behind.
+      const cache = cacheOf([mk(1, 7), mk(2, 7)]);
+      const replayed = [mk(1, 7), mk(2, 7)];
+      const callbacks = cache.applyOperations(
+        [
+          op('delete', mk(1, 7)),
+          op('delete', mk(2, 7)),
+          ...replayed.map(r => op('insert', r)),
+        ],
+        {} as any,
+        { skipIdenticalUpdates: true }
+      );
+      expect(callbacks).toEqual([]);
+      expect(cache.id.find(1)).toBe(replayed[0]);
+      expect(cache.name.find('score 2')).toBe(replayed[1]);
+      expect([...cache.player.filter(7)]).toEqual(replayed);
+
+      cache.applyOperations([op('delete', mk(1, 7))], {} as any);
+      expect(cache.id.find(1)).toBeNull();
+      expect(cache.name.find('score 1')).toBeNull();
+      expect(ids(cache.player.filter(7))).toEqual([2]);
+    });
+
+    test('reconnect on a table without a primary key: an unchanged row stays, a changed one moves', () => {
+      // Without a primary key a row's id is the row itself, so reconnect's
+      // replay pairs only an identical row into an update; a changed row is a
+      // delete of the old id and an insert of the new one.
+      const { tally } = schema({
+        tally: table(
+          {
+            name: 'tally',
+            indexes: [
+              {
+                accessor: 'player',
+                name: 'tally_player_idx_btree',
+                algorithm: 'btree',
+                columns: ['player'],
+              },
+              {
+                accessor: 'label',
+                name: 'tally_label_idx_btree',
+                algorithm: 'btree',
+                columns: ['label'],
+              },
+            ],
+            constraints: [
+              {
+                name: 'tally_label_key',
+                constraint: 'unique',
+                columns: ['label'],
+              },
+            ],
+          },
+          t.row({ player: t.u32(), label: t.string() })
+        ),
+      }).schemaType.tables;
+      const cache: any = new TableCacheImpl(tally as any);
+      const tallyOp = (type: 'insert' | 'delete', row: object) => ({
+        type,
+        rowId: JSON.stringify(row),
+        row,
+      });
+      cache.applyOperations(
+        [
+          tallyOp('insert', { player: 7, label: 'kept' }),
+          tallyOp('insert', { player: 7, label: 'changed' }),
+        ],
+        {} as any
+      );
+      const kept = { player: 7, label: 'kept' };
+      const changed = { player: 8, label: 'changed' };
+      const callbacks = cache.applyOperations(
+        [
+          tallyOp('delete', { player: 7, label: 'kept' }),
+          tallyOp('delete', { player: 7, label: 'changed' }),
+          tallyOp('insert', kept),
+          tallyOp('insert', changed),
+        ],
+        {} as any,
+        { skipIdenticalUpdates: true }
+      );
+      expect(callbacks.map((cb: { type: string }) => cb.type).sort()).toEqual([
+        'delete',
+        'insert',
+      ]);
+      expect(cache.label.find('kept')).toBe(kept);
+      expect(cache.label.find('changed')).toBe(changed);
+      expect([...cache.player.filter(7)]).toEqual([kept]);
+      expect([...cache.player.filter(8)]).toEqual([changed]);
+
+      cache.applyOperations([tallyOp('delete', kept)], {} as any);
+      expect(cache.label.find('kept')).toBeNull();
+      expect([...cache.player.filter(7)]).toEqual([]);
+    });
+
+    test('two rows swapping unique values by updates in one transaction', () => {
+      const cache = cacheOf([mk(1, 7), mk(2, 7)]);
+      const one = { ...mk(1, 7), name: 'score 2' };
+      const two = { ...mk(2, 7), name: 'score 1' };
+      cache.applyOperations(
+        [
+          op('delete', mk(1, 7)),
+          op('delete', mk(2, 7)),
+          op('insert', one),
+          op('insert', two),
+        ],
+        {} as any
+      );
+      expect(cache.name.find('score 1')).toBe(two);
+      expect(cache.name.find('score 2')).toBe(one);
+    });
+
+    // A table with a unique and a BTree index on one column of `type`.
+    const indexedOn = (type: any) => {
+      const { probe } = schema({
+        probe: table(
+          {
+            name: 'probe',
+            indexes: [
+              {
+                accessor: 'unique',
+                name: 'probe_unique_idx_btree',
+                algorithm: 'btree',
+                columns: ['unique'],
+              },
+              {
+                accessor: 'shared',
+                name: 'probe_shared_idx_btree',
+                algorithm: 'btree',
+                columns: ['shared'],
+              },
+            ],
+            constraints: [
+              {
+                name: 'probe_unique_key',
+                constraint: 'unique',
+                columns: ['unique'],
+              },
+            ],
+          },
+          t.row({ id: t.u32().primaryKey(), unique: type, shared: type })
+        ),
+      }).schemaType.tables;
+      return new TableCacheImpl(probe as any) as any;
+    };
+    // What the scan the index replaced answers (`find` takes the full key
+    // as a tuple, or a bare value; `filter` one value).
+    const scanFind = (cache: any, colVal: unknown) => {
+      const expected = Array.isArray(colVal) ? colVal : [colVal];
+      return (
+        [...cache.iter()].find((row: any) =>
+          deepEqual([row.unique], expected)
+        ) ?? null
+      );
+    };
+    const scanFilter = (cache: any, value: unknown) =>
+      [...cache.iter()].filter((row: any) => deepEqual(row.shared, value));
+
+    // Columns a module can index through `indexes:` whose only map key would
+    // come from the serializer, which coerces what it is given (these keep the
+    // scan); and floats, where a Map and `===` disagree on NaN.
+    const Point = t.object('Point', { x: t.u32() });
+    const hazards: {
+      name: string;
+      type: () => any;
+      values: unknown[];
+      lookups: unknown[];
+    }[] = [
+      {
+        name: 'an array of strings',
+        type: () => t.array(t.string()),
+        values: [['a', 'b'], ['ab']],
+        lookups: ['ab', ['a', 'b'], [['a', 'b']], [['ab']], ['ab'], [[]]],
+      },
+      {
+        name: 'an array of u32',
+        type: () => t.array(t.u32()),
+        values: [[1, 2], [0]],
+        lookups: [[[1, 2]], [[0]], [1, 2], [0], [[1.5, 2]], [{ 0: 1, 1: 2 }]],
+      },
+      {
+        name: 'a struct',
+        type: () => Point,
+        values: [{ x: 1 }, { x: 2 }],
+        lookups: [{ x: 1 }, { x: 1.9 }, { x: '1' }, { x: 1, y: 0 }],
+      },
+      {
+        name: 'an option',
+        type: () => t.option(t.u32()),
+        values: [1, undefined],
+        lookups: [1, 1.5, '1', null, undefined],
+      },
+      {
+        name: 'an option of unit',
+        type: () => t.option(t.unit()),
+        values: [{}, undefined],
+        lookups: [{}, undefined, null, { tag: 'some', value: {} }],
+      },
+      {
+        name: 'a result of units',
+        type: () => t.result(t.unit(), t.unit()),
+        values: [{ ok: {} }, { err: {} }],
+        lookups: [{ ok: {} }, { err: {} }, { tag: 'ok', value: {} }, {}],
+      },
+      {
+        name: 'an f64',
+        type: () => t.f64(),
+        values: [0, -0, NaN, 1.5],
+        lookups: [0, -0, NaN, 1.5, '1.5', undefined, null],
+      },
+    ];
+    for (const { name, type, values, lookups } of hazards) {
+      test(`on ${name} column, every lookup answers as the scan did`, () => {
+        const cache = indexedOn(type());
+        const rows = values.map((value, i) => ({
+          id: i + 1,
+          unique: value,
+          shared: value,
+        }));
+        cache.applyOperations(
+          rows.map(row => ({ type: 'insert', rowId: row.id, row })),
+          {} as any
+        );
+        const check = () => {
+          for (const lookup of lookups) {
+            expect(cache.unique.find(lookup)).toBe(scanFind(cache, lookup));
+            if (!Array.isArray(lookup)) {
+              expect([...cache.shared.filter(lookup)]).toEqual(
+                scanFilter(cache, lookup)
+              );
+            }
+          }
+        };
+        check();
+        // and after each row leaves in turn
+        for (const row of rows) {
+          cache.applyOperations(
+            [{ type: 'delete', rowId: row.id, row: { ...row } }],
+            {} as any
+          );
+          check();
+        }
+      });
+    }
+
+    test("a unique float column holding 0 and -0 answers with the scan's first row, after an update too", () => {
+      const cache = indexedOn(t.f64());
+      const zero = { id: 1, unique: 0, shared: 0 };
+      const minusZero = { id: 2, unique: -0, shared: -0 };
+      cache.applyOperations(
+        [zero, minusZero].map(row => ({ type: 'insert', rowId: row.id, row })),
+        {} as any
+      );
+      const iter = vi.spyOn(cache, 'iter');
+      expect(cache.unique.find(0)).toBe(zero);
+      expect(cache.unique.find(-0)).toBe(zero);
+      const updated = { id: 1, unique: 0, shared: 1 };
+      cache.applyOperations(
+        [
+          { type: 'delete', rowId: 1, row: zero },
+          { type: 'insert', rowId: 1, row: updated },
+        ],
+        {} as any
+      );
+      // the update keeps row 1's place in the table, so the scan still finds it first
+      expect(cache.unique.find(0)).toBe(scanFind(cache, 0));
+      expect(cache.unique.find(0)).toBe(updated);
+      cache.applyOperations(
+        [{ type: 'delete', rowId: 2, row: minusZero }],
+        {} as any
+      );
+      expect(cache.unique.find(-0)).toBe(updated);
+      expect(iter).toHaveBeenCalled(); // two rows to one key: the scan picks
+    });
+
+    test('a lookup equal to an Identity but not one matches as the scan does', () => {
+      const cache = indexedOn(t.identity());
+      const owner = Identity.fromString('ab'.repeat(32));
+      const row = { id: 1, unique: owner, shared: owner };
+      cache.applyOperations([{ type: 'insert', rowId: 1, row }], {} as any);
+      const plain = { __identity__: owner.__identity__ };
+      const extra = { __identity__: owner.__identity__, more: 1 };
+      const extraOnInstance = Object.assign(new Identity(owner.__identity__), {
+        more: 1,
+      });
+      const posing = {
+        __identity__: owner.__identity__,
+        constructor: Identity,
+      };
+      for (const lookup of [
+        plain,
+        extra,
+        extraOnInstance,
+        posing,
+        owner.__identity__,
+        null,
+        undefined,
+      ]) {
+        expect(cache.unique.find(lookup)).toBe(scanFind(cache, lookup));
+        expect([...cache.shared.filter(lookup)]).toEqual(
+          scanFilter(cache, lookup)
+        );
+      }
+      expect(cache.unique.find(plain)).toBe(row);
+      expect(cache.unique.find(extra)).toBeNull();
+    });
+
+    test('an index on a table without a primary key', () => {
+      const { tally } = schema({
+        tally: table(
+          {
+            name: 'tally',
+            indexes: [
+              {
+                accessor: 'player',
+                name: 'tally_player_idx_btree',
+                algorithm: 'btree',
+                columns: ['player'],
+              },
+            ],
+          },
+          t.row({ player: t.u32(), points: t.u32() })
+        ),
+      }).schemaType.tables;
+      const cache: any = new TableCacheImpl(tally as any);
+      // without a primary key a row's id is the row itself
+      const tallyOp = (type: 'insert' | 'delete', row: object) => ({
+        type,
+        rowId: JSON.stringify(row),
+        row,
+      });
+      cache.applyOperations(
+        [
+          tallyOp('insert', { player: 7, points: 1 }),
+          tallyOp('insert', { player: 7, points: 2 }),
+          tallyOp('insert', { player: 8, points: 3 }),
+        ],
+        {} as any
+      );
+      cache.applyOperations(
+        [tallyOp('delete', { player: 7, points: 1 })],
+        {} as any
+      );
+      expect([...cache.player.filter(7)]).toEqual([{ player: 7, points: 2 }]);
+      expect([...cache.player.filter(8)]).toEqual([{ player: 8, points: 3 }]);
+    });
+
+    test('a range still answers, by scanning', () => {
+      const cache = cacheOf([mk(1, 7), mk(2, 8), mk(3, 9)]);
+      const range = {
+        from: { tag: 'included', value: 8 },
+        to: { tag: 'unbounded' },
+      };
+      expect(ids(cache.player.filter(range))).toEqual([2, 3]);
+    });
+
+    test('lookups follow inserts, updates that change the key, and deletes', () => {
+      const cache = cacheOf([mk(1, 7), mk(2, 7)]);
+      // an update arrives as a delete and an insert of the same primary key
+      cache.applyOperations(
+        [op('delete', mk(1, 7)), op('insert', mk(1, 8, 5))],
+        {} as any
+      );
+      expect(ids(cache.player.filter(7))).toEqual([2]);
+      expect(cache.player.filter(8).next().value).toEqual(mk(1, 8, 5));
+      expect(cache.id.find(1)).toEqual(mk(1, 8, 5));
+      cache.applyOperations([op('delete', mk(2, 7))], {} as any);
+      expect(ids(cache.player.filter(7))).toEqual([]);
+      expect(cache.name.find('score 2')).toBeNull();
+    });
+
+    test('a row held by two subscriptions stays until both let it go', () => {
+      const cache = cacheOf([mk(1, 7)]);
+      cache.applyOperations([op('insert', mk(1, 7))], {} as any);
+      cache.applyOperations([op('delete', mk(1, 7))], {} as any);
+      expect(ids(cache.player.filter(7))).toEqual([1]);
+      cache.applyOperations([op('delete', mk(1, 7))], {} as any);
+      expect(ids(cache.player.filter(7))).toEqual([]);
+    });
+
+    test('every lookup agrees with a scan through random changes', () => {
+      const cache = cacheOf([]);
+      const live = new Map<number, Score>();
+      let seed = 1;
+      const next = (n: number) => {
+        seed = (seed * 1103515245 + 12345) % 2 ** 31;
+        return seed % n;
+      };
+      for (let round = 0; round < 200; round++) {
+        const ops = [];
+        const touched = new Set<number>();
+        for (let k = 0; k < 5; k++) {
+          const id = next(40);
+          if (touched.has(id)) continue;
+          touched.add(id);
+          const had = live.get(id);
+          const roll = next(3);
+          if (!had) {
+            const row = mk(id, next(6), round);
+            ops.push(op('insert', row));
+            live.set(id, row);
+          } else if (roll === 0) {
+            ops.push(op('delete', had));
+            live.delete(id);
+          } else {
+            const row = mk(id, next(6), round);
+            ops.push(op('delete', had), op('insert', row));
+            live.set(id, row);
+          }
+        }
+        cache.applyOperations(ops, {} as any);
+        for (let player = 0; player < 6; player++) {
+          const scanned = [...live.values()].filter(r => r.player === player);
+          expect(ids(cache.player.filter(player))).toEqual(ids(scanned));
+        }
+        for (let id = 0; id < 40; id++) {
+          expect(cache.id.find(id)).toEqual(live.get(id) ?? null);
+          expect(cache.name.find(`score ${id}`)).toEqual(live.get(id) ?? null);
+        }
+      }
     });
   });
 
