@@ -1,4 +1,10 @@
 import { deepEqual, type AlgebraicType } from '../';
+import {
+  isOptionType,
+  isPrimitiveTag,
+  isResultType,
+  isSpecialProductField,
+} from '../lib/algebraic_type';
 
 /**
  * What an index reads of the cached table. The table cache calls the
@@ -26,39 +32,6 @@ interface KeyRule {
   keyOf(value: unknown): Key;
   exact(value: unknown): boolean;
 }
-
-/** Types whose value is its own key: a `Map` finds it by `SameValueZero`, the scan's `===` but for NaN. */
-const SELF_KEYED = new Set<AlgebraicType['tag']>([
-  'Bool',
-  'String',
-  'U8',
-  'U16',
-  'U32',
-  'U64',
-  'U128',
-  'U256',
-  'I8',
-  'I16',
-  'I32',
-  'I64',
-  'I128',
-  'I256',
-  'F32',
-  'F64',
-]);
-
-/**
- * The one field of `Identity`, `ConnectionId`, `Timestamp`, `Uuid` and
- * `TimeDuration` (`AlgebraicType.intoMapKey` keys them by it too). The
- * deserializer makes each an instance with that field as its only own key.
- */
-const SPECIAL_FIELDS = new Set([
-  '__identity__',
-  '__connection_id__',
-  '__timestamp_micros_since_unix_epoch__',
-  '__uuid__',
-  '__time_duration_micros__',
-]);
 
 /** The key stored NaN rows share: no lookup has it, as `NaN === NaN` is false. */
 const NAN_ROWS = Symbol('NaN rows');
@@ -93,8 +66,12 @@ const enumKeyed: KeyRule = {
 };
 
 /**
- * The rule for a column type, or `undefined` for one an index does not key:
- * arrays, structs, options and sums with payloads keep the table scan. Their
+ * The rule for a column type, or `undefined` for one an index does not key.
+ * Primitives key by their value and the special products (`Identity`,
+ * `ConnectionId`, `Timestamp`, `TimeDuration`, `Uuid`) by their one field, as
+ * `AlgebraicType.intoMapKey` keys them; the deserializer makes each special
+ * product an instance with that field as its only own key. Arrays, other
+ * structs, options and sums with payloads keep the table scan. Their
  * only map key would come from the serializer, which coerces what it is given
  * (`{x: 1.9}` writes as `{x: 1}`, a string as the array of its characters)
  * and tells `0` from `-0` where `deepEqual` does not, so a lookup could miss
@@ -103,23 +80,18 @@ const enumKeyed: KeyRule = {
  * `FilterableValue`).
  */
 export function keyRuleFor(type: AlgebraicType): KeyRule | undefined {
-  if (SELF_KEYED.has(type.tag)) return selfKeyed;
+  if (isPrimitiveTag(type.tag)) return selfKeyed;
   if (type.tag === 'Product') {
     const [only, ...rest] = type.value.elements;
-    if (only?.name && rest.length === 0 && SPECIAL_FIELDS.has(only.name)) {
+    if (only?.name && rest.length === 0 && isSpecialProductField(only.name)) {
       return specialKeyed(only.name);
     }
     return undefined;
   }
   if (type.tag === 'Sum') {
-    // The deserializer gives an option (`some`/`none`) and a result
-    // (`ok`/`err`) shapes of their own, with no `tag`.
-    const [first, second, ...more] = type.value.variants;
-    const special =
-      more.length === 0 &&
-      ((first?.name === 'some' && second?.name === 'none') ||
-        (first?.name === 'ok' && second?.name === 'err'));
-    if (special) return undefined;
+    // The deserializer gives an option and a result shapes of their own, with
+    // no `tag`.
+    if (isOptionType(type.value) || isResultType(type.value)) return undefined;
     const plain = type.value.variants.every(
       variant =>
         variant.algebraicType.tag === 'Product' &&
